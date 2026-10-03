@@ -54,7 +54,11 @@ An Admin can add a Notion product with `/adddatabase Name | https://www.notion.s
 
 CA and Notion use the same annual entitlement. The portal stores four independent datasets: `daily_ca`, `editorial`, `place_in_news`, and `international_orgs`. Users can browse with `/ca dataset | YYYY-MM-DD | topic | subtopic | keyword`, bookmark/read/revise records, and save private notes with `/canote`.
 
-For bidirectional sync, set `NOTION_API_KEY` and `NOTION_DATABASE_ID` in the server environment, invite the integration to the Notion database with read/insert/update permissions, then restart the bot. Admin commands are `/caadd`, `/notionsync`, `/notionstatus`, and `/notionresolve <record_id> portal|notion`. Pushes are queued and retried; pulls report success only after Notion returns a successful API response. Conflicts stay visible until an Admin selects a side.
+For bidirectional sync, set `NOTION_API_KEY` and `NOTION_DATABASE_ID` in the server environment, invite the integration to the Notion database with read/insert/update permissions, then restart the bot. Admin commands are `/caadd`, `/notionsync [dataset=daily_ca] [from=YYYY-MM-DD] [to=YYYY-MM-DD]`, `/notionstatus`, and `/notionresolve <record_id> portal|notion`. Pushes are queued and retried; pulls report success only after Notion returns a successful API response. Conflicts stay visible until an Admin selects a side.
+
+Notion page zoom is controlled by the Notion client/browser accessibility settings; the Notion API cannot change an individual user's zoom level. The Telegram CA record view provides the same source/content data in a compact message view.
+
+Admins can use `/resync` to revalidate users and chats already stored by the bot, and `/chatadd <chat_id>` to register an existing chat after Telegram confirms the bot is a member. Telegram does not expose an API to enumerate users who have never started the bot or groups the bot has never observed.
 
 The Notion database must contain properties named `Title` (title), `Date` (date), `Dataset` (select), `Topic`, `Subtopic`, `Content`, `Source`, `UPSC Mapping`, `Prelims Mapping`, `Mains Mapping`, `PYQ Mapping`, and `Attachments` (rich text), `Tags` (multi-select), and `Source URL` / `Image URL` (URL). Add these `Dataset` select options: `daily_ca`, `editorial`, `place_in_news`, and `international_orgs`. The Notion API integration token does not provision or revoke individual workspace membership. A public share link may remain usable after portal expiry if a user saved or shared it; strict revocation needs private per-user Notion permissions outside this sync API.
 
@@ -64,6 +68,6 @@ Users can open **Invite Friends** or use `/referral` to get an opaque invite lin
 
 ## Vercel
 
-This checkout is not currently configured as a Vercel deployment: it has no Vercel function configuration, and its bot starts background tasks intended for a persistent process. Do not treat a successful GitHub push as a Vercel-ready deployment. A serverless lifecycle and scheduled-task design must be validated before deploying it there.
+This checkout is not currently configured as a Vercel deployment: it has no Vercel function configuration, and its webhook app starts long-running workers for Notion retries, deletion scheduling, backups, and broadcasts. Vercel functions are not a persistent worker host, so adding a routing file alone would silently break these jobs. Use the existing persistent-process deployment, or first move workers to a durable external queue/scheduler and validate the serverless webhook lifecycle.
 
 Koi error aaye Railway ke **Deployments → Logs** me, wahi paste kar dena — turant fix karunga.
