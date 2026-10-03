@@ -27,8 +27,5 @@ if not _raw_webapp_url:
 WEBAPP_BASE_URL = _raw_webapp_url
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "").strip()
-GROUP_AUTO_DELETE_SECONDS = int(os.environ.get("GROUP_AUTO_DELETE_SECONDS", "86400"))
-if not 0 <= GROUP_AUTO_DELETE_SECONDS <= 604800:
-    raise ValueError("GROUP_AUTO_DELETE_SECONDS must be between 0 and 604800")
 
 BOT_NAME = "UPSC Course Zone by Professor"

@@ -49,6 +49,8 @@ class Course(Base):
     group_link = Column(String(300), nullable=True)
     is_trending = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)
+    is_seeded = Column(Boolean, default=False, nullable=False)
+    access_duration_days = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     sections = relationship("Section", secondary=course_sections, back_populates="courses", lazy="selectin")
@@ -87,6 +89,7 @@ class UserCourse(Base):
     user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
     course_id = Column(Integer, ForeignKey("courses.id"), nullable=False)
     granted_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
 
 
 class UserActivity(Base):
@@ -259,7 +262,7 @@ async def seed_courses():
         sections_by_key = {s.key: s for s in result.scalars().all()}
 
         for name, faculty, medium, notes, price, section_keys, batch_id in COURSE_SEED:
-            course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price)
+            course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price, is_seeded=True)
             for key in section_keys:
                 sec = sections_by_key.get(key)
                 if sec:
@@ -400,10 +403,11 @@ async def migrate_v2():
                 course.medium = seed_data["medium"]
                 course.notes = seed_data["notes"]
                 course.is_active = True
+                course.is_seeded = True
                 del seed_dict[course.name]
                 courses_changed = True
             else:
-                if course.is_active:
+                if course.is_seeded and course.is_active:
                     course.is_active = False
                     courses_changed = True
 
@@ -414,7 +418,8 @@ async def migrate_v2():
                 medium=seed_data["medium"], 
                 notes=seed_data["notes"], 
                 price=seed_data["price"],
-                is_active=True
+                is_active=True,
+                is_seeded=True,
             )
             for key in seed_data["section_keys"]:
                 sec = sections.get(key)
@@ -512,4 +517,17 @@ async def migrate_v5():
         )
         await conn.exec_driver_sql(
             "ALTER TABLE user_courses ADD CONSTRAINT uq_user_courses_user_course UNIQUE (user_id, course_id)"
+        )
+
+
+async def migrate_v6():
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "ALTER TABLE courses ADD COLUMN IF NOT EXISTS is_seeded BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        await conn.exec_driver_sql(
+            "ALTER TABLE courses ADD COLUMN IF NOT EXISTS access_duration_days INTEGER NULL"
+        )
+        await conn.exec_driver_sql(
+            "ALTER TABLE user_courses ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP NULL"
         )

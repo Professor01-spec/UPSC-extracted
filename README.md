@@ -21,7 +21,7 @@ Bot service → **Variables** tab. Set these values there; do not commit them:
 
 `PORT` and `RAILWAY_PUBLIC_DOMAIN` are provided by Railway. Without a valid `WEBHOOK_SECRET_TOKEN`, the service disables the Telegram webhook.
 
-Bot-sent messages in private and group chats are queued for deletion after 24 hours. Connected groups and supergroups also use Telegram's native 24-hour auto-delete timer, which applies to every member's new messages when the bot has permission. Set `GROUP_AUTO_DELETE_SECONDS=0` to disable the group-wide timer; private-chat cleanup remains bot-message-only.
+Only messages sent by this bot are queued for deletion after 24 hours in private chats, groups, and supergroups. The bot attempts to disable Telegram's group-wide auto-delete timer so member messages are not deleted. This requires the bot to have permission; if Telegram rejects the change, a group admin must turn that timer off in chat settings.
 
 ### 4. Redeploy
 Variables save karne ke baad Railway khud redeploy karega. **Deployments** tab me "Success" dikhna chahiye.
@@ -44,6 +44,12 @@ Variables save karne ke baad Railway khud redeploy karega. **Deployments** tab m
 - `requirements.txt`, `Procfile`, `.gitignore`
 
 `app.env` is a local-only convenience file and is ignored by Git. Production secrets must be configured in the host's environment settings.
+
+## Database access products
+
+An Admin can add a Notion product with `/adddatabase Name | https://www.notion.so/... | [price] | [days]`. Price defaults to ₹1,000 and duration to 365 days. Products appear under **Database Access**, use the existing reviewed payment flow, and expose their link only while the portal entitlement is active. Paid renewals extend an active term; expired terms restart from the approval date.
+
+The bot does not currently provision or revoke Notion workspace membership through Notion's API. If the configured URL is a public Notion share link, a user who saved or shared that URL may retain access after portal expiry. Strict revocable access requires a Notion workspace integration and private page permissions.
 
 ## Vercel
 

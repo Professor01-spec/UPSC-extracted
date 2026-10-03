@@ -2,17 +2,20 @@ import csv
 import io
 import asyncio
 import logging
-from datetime import datetime
+import math
+from datetime import datetime, timedelta
+from html import escape
+from urllib.parse import urlparse
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, ChatMemberUpdated
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from sqlalchemy import select, func, desc
+from sqlalchemy import case, select, func, desc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage, ConnectedChat, AuditEvent
 from keyboards import AdminAddCourse, AdminBroadcast
-from config import ADMIN_ID, GROUP_AUTO_DELETE_SECONDS
+from config import ADMIN_ID
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -60,14 +63,14 @@ async def on_bot_added_to_chat(event: ChatMemberUpdated):
             if not chat:
                 session.add(ConnectedChat(id=event.chat.id, type=event.chat.type))
                 await session.commit()
-            if event.chat.type in ("group", "supergroup") and GROUP_AUTO_DELETE_SECONDS:
+            if event.chat.type in ("group", "supergroup"):
                 try:
                     await event.bot.set_chat_message_auto_delete_time(
                         chat_id=event.chat.id,
-                        message_auto_delete_time=GROUP_AUTO_DELETE_SECONDS,
+                        message_auto_delete_time=0,
                     )
                 except Exception:
-                    logger.info("Group auto-delete could not be enabled; check bot admin permissions")
+                    logger.info("Group-wide auto-delete could not be disabled; check bot admin permissions")
                 
         # If bot is removed or kicked
         elif event.new_chat_member.status in ["left", "kicked", "restricted"]:
@@ -267,6 +270,82 @@ async def cmd_quick_add(message: Message):
     )
 
 
+@router.message(Command("adddatabase"))
+async def cmd_add_database(message: Message):
+    if not admin_only(message):
+        return
+    body = message.text.split(maxsplit=1)
+    if len(body) != 2:
+        await message.answer(
+            "Usage: /adddatabase Name | https://www.notion.so/... | [price] | [days]\n"
+            "Price defaults to ₹1000 and duration defaults to 365 days."
+        )
+        return
+
+    parts = [part.strip() for part in body[1].split("|")]
+    if not 2 <= len(parts) <= 4:
+        await message.answer("Provide a name, Notion URL, optional price, and optional duration in days.")
+        return
+    name, access_url = parts[:2]
+    price_text = parts[2] if len(parts) > 2 and parts[2] else "1000"
+    duration_text = parts[3] if len(parts) > 3 and parts[3] else "365"
+    try:
+        parsed_url = urlparse(access_url)
+        host = (parsed_url.hostname or "").lower()
+    except ValueError:
+        await message.answer("Use a valid HTTPS Notion share URL.")
+        return
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or not (host == "notion.so" or host.endswith(".notion.so") or host == "notion.site" or host.endswith(".notion.site"))
+        or len(access_url) > 300
+    ):
+        await message.answer("Use a valid HTTPS Notion share URL.")
+        return
+    price, error = _parse_price(price_text)
+    if error or price is None or not math.isfinite(price) or not 0 < price <= 99_999_999.99:
+        await message.answer(error or "Price must be between ₹0.01 and ₹99,999,999.99.")
+        return
+    try:
+        duration_days = int(duration_text)
+    except ValueError:
+        duration_days = 0
+    if not 1 <= duration_days <= 3650:
+        await message.answer("Duration must be between 1 and 3650 days.")
+        return
+    if not name or len(name) > 150:
+        await message.answer("Name must be between 1 and 150 characters.")
+        return
+
+    async with async_session() as session:
+        product = Course(
+            name=name,
+            faculty="Notion Database",
+            medium="Online",
+            notes=f"Time-limited database access: {duration_days} days",
+            price=price,
+            group_link=access_url,
+            is_active=True,
+            access_duration_days=duration_days,
+        )
+        session.add(product)
+        await session.flush()
+        session.add(AuditEvent(
+            actor_id=message.from_user.id,
+            action="database.product.created",
+            target_type="course",
+            target_id=str(product.id),
+        ))
+        await session.commit()
+
+    await message.answer(
+        f"✅ Database product created: {escape(name)}\n"
+        f"Price: ₹{price:g} | Access: {duration_days} days | ID: {product.id}"
+    )
+
+
 @router.message(Command("listsectionkeys"))
 async def cmd_list_section_keys(message: Message):
     if not admin_only(message):
@@ -312,14 +391,47 @@ async def cmd_grant(message: Message):
         existing = await session.execute(
             select(UserCourse).where(UserCourse.user_id == user_id, UserCourse.course_id == course_id)
         )
-        if existing.scalar_one_or_none():
+        existing_access = existing.scalar_one_or_none()
+        now = datetime.utcnow()
+        if existing_access and (
+            not course.access_duration_days
+            or existing_access.expires_at is None
+            or existing_access.expires_at > now
+        ):
             await message.answer("ℹ️ This user already owns this course.")
             return
-        await session.execute(
-            pg_insert(UserCourse)
-            .values(user_id=user_id, course_id=course_id)
-            .on_conflict_do_nothing(index_elements=["user_id", "course_id"])
-        )
+        if course.access_duration_days:
+            duration = timedelta(days=course.access_duration_days)
+            renewal_expiry = now + duration
+            grant = pg_insert(UserCourse).values(
+                user_id=user_id,
+                course_id=course_id,
+                expires_at=renewal_expiry,
+            )
+            await session.execute(
+                grant.on_conflict_do_update(
+                    index_elements=["user_id", "course_id"],
+                    set_={
+                        "expires_at": case(
+                            (UserCourse.expires_at > now, UserCourse.expires_at + duration),
+                            else_=renewal_expiry,
+                        )
+                    },
+                )
+            )
+            access_expires_at = await session.scalar(
+                select(UserCourse.expires_at).where(
+                    UserCourse.user_id == user_id,
+                    UserCourse.course_id == course_id,
+                )
+            )
+        else:
+            access_expires_at = None
+            await session.execute(
+                pg_insert(UserCourse)
+                .values(user_id=user_id, course_id=course_id)
+                .on_conflict_do_nothing(index_elements=["user_id", "course_id"])
+            )
         session.add(AuditEvent(
             actor_id=message.from_user.id,
             action="course.access.granted",
@@ -329,12 +441,20 @@ async def cmd_grant(message: Message):
         await session.commit()
 
     try:
-        group_text = (
-            f"🎉 Professor has assigned you <b>{course.name}</b>!\n\n"
-            + (f"Join the group here: {course.group_link}" if course.group_link
-               else "The group link will be added shortly — check 'My Courses' again soon.")
+        if course.access_duration_days:
+            access_text = (
+                f"Open your database access: {escape(course.group_link, quote=True)}\n"
+                f"Valid through {access_expires_at:%d %b %Y}."
+            )
+        else:
+            access_text = (
+                f"Join the group here: {course.group_link}"
+                if course.group_link else "The group link will be added shortly."
+            )
+        await message.bot.send_message(
+            user_id,
+            f"🎉 Professor has assigned you <b>{escape(course.name)}</b>!\n\n{access_text}",
         )
-        await message.bot.send_message(user_id, group_text)
     except Exception:
         pass
     await message.answer(f"✅ Granted {course.name} (ID {course.id}) to user {uid_tag(user_id)}.")
@@ -849,13 +969,45 @@ async def cb_approve(call: CallbackQuery):
         if not order or order.status != "pending":
             await call.answer("This order has already been processed.", show_alert=True)
             return
+        course = await session.get(Course, order.course_id)
+        if not course:
+            await call.answer("This course is no longer available.", show_alert=True)
+            return
         order.status = "approved"
-        order.decided_at = datetime.utcnow()
-        await session.execute(
-            pg_insert(UserCourse)
-            .values(user_id=order.user_id, course_id=order.course_id)
-            .on_conflict_do_nothing(index_elements=["user_id", "course_id"])
-        )
+        now = datetime.utcnow()
+        order.decided_at = now
+        if course.access_duration_days:
+            duration = timedelta(days=course.access_duration_days)
+            renewal_expiry = now + duration
+            grant = pg_insert(UserCourse).values(
+                user_id=order.user_id,
+                course_id=order.course_id,
+                expires_at=renewal_expiry,
+            )
+            await session.execute(
+                grant.on_conflict_do_update(
+                    index_elements=["user_id", "course_id"],
+                    set_={
+                        "expires_at": case(
+                            (UserCourse.expires_at > now, UserCourse.expires_at + duration),
+                            else_=renewal_expiry,
+                        )
+                    },
+                )
+            )
+            access_expires_at = await session.scalar(
+                select(UserCourse.expires_at).where(
+                    UserCourse.user_id == order.user_id,
+                    UserCourse.course_id == order.course_id,
+                )
+            )
+        else:
+            access_expires_at = None
+            await session.execute(
+                pg_insert(UserCourse)
+                .values(user_id=order.user_id, course_id=order.course_id)
+                .on_conflict_do_nothing(index_elements=["user_id", "course_id"])
+            )
         session.add(AuditEvent(
             actor_id=call.from_user.id,
             action="payment.approved",
@@ -863,7 +1015,6 @@ async def cb_approve(call: CallbackQuery):
             target_id=str(order.id),
         ))
         await session.commit()
-        course = await session.get(Course, order.course_id)
 
     # ANTI-PIRACY: Try to generate Single-Use Link if group_link is a Chat ID
     link = course.group_link
@@ -879,11 +1030,18 @@ async def cb_approve(call: CallbackQuery):
     else:
         await call.message.edit_text(call.message.text + "\n\n✅ APPROVED")
 
-    group_text = (
-        f"🎉 <b>{course.name}</b> has been approved!\n\n"
-        + (f"Join the private group here (Single-Use Link): {link}" if link
-           else "The group link will be added shortly — check 'My Courses' again soon.")
-    )
+    if course.access_duration_days:
+        group_text = (
+            f"🎉 <b>{escape(course.name)}</b> has been approved!\n\n"
+            f"Open your database: {escape(link or '', quote=True)}\n"
+            f"Access is valid through {access_expires_at:%d %b %Y}."
+        )
+    else:
+        group_text = (
+            f"🎉 <b>{course.name}</b> has been approved!\n\n"
+            + (f"Join the private group here (Single-Use Link): {link}" if link
+               else "The group link will be added shortly — check 'My Courses' again soon.")
+        )
     await call.bot.send_message(order.user_id, group_text)
     await call.answer("Approved ✅")
 
@@ -1065,6 +1223,7 @@ async def cmd_admin_help(message: Message):
         "/weekly_report — Generate AI Business Report\n"
         "/restart — Clear temporary cache (no data lost)\n\n"
         "<b>Courses</b>\n"
+        "/adddatabase Name | Notion URL | [price] | [days] — create time-limited database access\n"
         "/addcourse — add a new course (step-by-step)\n"
         "/quickadd Name | Faculty | Medium | Notes | Price|TBD | section_keys — add a course in ONE message\n"
         "/listsectionkeys — see all section keys (for /quickadd, /movecourse)\n"

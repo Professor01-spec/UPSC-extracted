@@ -18,8 +18,8 @@ from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import and_, delete, select, update as sql_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID, WEBHOOK_SECRET_TOKEN, GROUP_AUTO_DELETE_SECONDS
-from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, migrate_v5, async_session, Section, Course, ConnectedChat, TelegramUpdate
+from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID, WEBHOOK_SECRET_TOKEN
+from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6, async_session, Section, Course, ConnectedChat, TelegramUpdate
 from keyboards import get_line
 from webapp_template import render_section_page
 from security import (
@@ -106,13 +106,15 @@ USER_COMMANDS = [
     BotCommand(command="help", description="Help & FAQ"),
     BotCommand(command="myid", description="Show my Telegram ID"),
     BotCommand(command="trending", description="Trending courses"),
+    BotCommand(command="databases", description="Browse annual database access"),
 ]
 
 ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="adminhelp", description="Full admin command list"),
     BotCommand(command="addcourse", description="Add course (guided)"),
     BotCommand(command="quickadd", description="Add course (one message)"),
-    BotCommand(command="addforall", description="Broadcast Ad to all groups (72h delete)"),
+    BotCommand(command="adddatabase", description="Add annual Notion database access"),
+    BotCommand(command="addforall", description="Broadcast Ad to all groups (24h delete)"),
     BotCommand(command="grant", description="Manually unlock a course for a user"),
     BotCommand(command="price", description="Change a course's price"),
     BotCommand(command="removecourse", description="Hide a course"),
@@ -176,9 +178,7 @@ async def daily_promotional_task(bot_instance: Bot):
             logger.error(f"Daily task loop error: {e}")
 
 
-async def enable_connected_group_auto_delete():
-    if not GROUP_AUTO_DELETE_SECONDS:
-        return
+async def disable_connected_group_auto_delete():
     async with async_session() as session:
         result = await session.execute(
             select(ConnectedChat).where(ConnectedChat.type.in_(("group", "supergroup")))
@@ -188,10 +188,10 @@ async def enable_connected_group_auto_delete():
         try:
             await bot.set_chat_message_auto_delete_time(
                 chat_id=chat.id,
-                message_auto_delete_time=GROUP_AUTO_DELETE_SECONDS,
+                message_auto_delete_time=0,
             )
         except Exception:
-            logger.info("Group auto-delete could not be enabled for a connected chat")
+            logger.info("Group-wide auto-delete could not be disabled for a connected chat")
 
 
 @asynccontextmanager
@@ -199,6 +199,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     await migrate_v4()
     await migrate_v5()
+    await migrate_v6()
     await seed_sections()
     await seed_courses()
     await migrate_v2()  # idempotent — restructures an existing DB to the v2 home-screen layout
@@ -224,7 +225,7 @@ async def lifespan(app: FastAPI):
     except TelegramBadRequest:
         logger.exception("Failed to set bot commands")
 
-    await enable_connected_group_auto_delete()
+    await disable_connected_group_auto_delete()
 
     if WEBAPP_BASE_URL and WEBHOOK_SECRET_VALID:
         webhook_url = f"{WEBAPP_BASE_URL}/webhook"
@@ -442,6 +443,7 @@ async def api_courses(
             {
                 "id": c.id, "name": c.name, "faculty": c.faculty, "medium": c.medium,
                 "notes": c.notes, "price": float(c.price) if c.price is not None else None,
+                "access_duration_days": c.access_duration_days,
             }
             for c in courses
         ]

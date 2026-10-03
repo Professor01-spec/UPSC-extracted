@@ -6,13 +6,14 @@ import re
 import time
 from datetime import datetime
 from collections import defaultdict
+from html import escape
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database import (
@@ -337,13 +338,14 @@ async def cb_trending(call: CallbackQuery):
 # ================= BUY FLOW & FLASH SALES (PROMO) =================
 def _course_detail_text(course: Course) -> str:
     price_tag = f"₹{int(course.price)}" if course.price is not None else "Price on request — Professor will confirm with you"
+    validity = f"{course.access_duration_days} days" if course.access_duration_days else "Lifetime"
     return (
         f"📘 <b>{course.name}</b>\n"
         f"🆔 Course ID: {course.id}\n"
         f"👨‍🏫 Faculty: {course.faculty or '—'}\n"
         f"🌐 Medium: {course.medium or '—'}\n"
         f"📝 Notes: {course.notes or '—'}\n"
-        f"💰 {price_tag}\n♾️ Validity: Lifetime\n\n"
+        f"💰 {price_tag}\n♾️ Validity: {validity}\n\n"
         "Choose a payment method below 👇"
     )
 
@@ -383,6 +385,47 @@ async def _get_available_course(course_id: int) -> Course | None:
     async with async_session() as session:
         course = await session.get(Course, course_id)
     return course if course and course.is_active else None
+
+
+async def _database_catalog_content():
+    async with async_session() as session:
+        result = await session.execute(
+            select(Course)
+            .where(Course.is_active == True, Course.access_duration_days.is_not(None))
+            .order_by(Course.name)
+        )
+        products = result.scalars().all()
+    if not products:
+        return (
+            "🗂 <b>Database Access</b>\n\nNo database access products are available right now.",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:main")]]),
+        )
+
+    rows = []
+    for product in products:
+        rows.append([InlineKeyboardButton(
+            text=f"{product.name[:28]} | ₹{product.price:g}/{product.access_duration_days}d",
+            callback_data=f"buy:{product.id}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="menu:main")])
+    description = "\n".join(
+        f"• {escape(product.name)} — ₹{product.price:g} for {product.access_duration_days} days"
+        for product in products[:30]
+    )
+    return f"🗂 <b>Database Access</b>\n\n{description}", InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("databases"))
+async def cmd_databases(message: Message):
+    text, keyboard = await _database_catalog_content()
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "databases:open")
+async def cb_databases(call: CallbackQuery):
+    text, keyboard = await _database_catalog_content()
+    await call.message.edit_text(text, reply_markup=keyboard)
+    await call.answer()
 
 
 async def _show_buy_screen(message: Message, course_id: int, tg_user=None, edit: bool = False):
@@ -767,24 +810,31 @@ async def cb_my_courses(call: CallbackQuery):
     async with async_session() as session:
         result = await session.execute(
             select(UserCourse, Course).join(Course, UserCourse.course_id == Course.id)
-            .where(UserCourse.user_id == call.from_user.id)
+            .where(
+                UserCourse.user_id == call.from_user.id,
+                or_(UserCourse.expires_at.is_(None), UserCourse.expires_at > datetime.utcnow()),
+            )
         )
         rows = result.all()
 
     if not rows:
         await call.message.edit_text(
-            "🧾 <b>My Courses</b>\n\nNo course has been assigned yet. Buy a course — it'll show here once approved!",
+            "🧾 <b>My Courses</b>\n\nNo active course or database access right now. Approved purchases appear here; expired database access can be renewed from Database Access.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:main")]]),
         )
         await call.answer()
         return
 
     kb_rows = []
-    for _uc, course in rows:
+    for entitlement, course in rows:
+        expiry = (
+            f" (access until {entitlement.expires_at.strftime('%d %b %Y')})"
+            if entitlement.expires_at else ""
+        )
         if course.group_link:
-            kb_rows.append([InlineKeyboardButton(text=f"📂 {course.name}", url=course.group_link)])
+            kb_rows.append([InlineKeyboardButton(text=f"📂 {course.name}{expiry}"[:64], url=course.group_link)])
         else:
-            kb_rows.append([InlineKeyboardButton(text=f"⏳ {course.name} (link pending)", callback_data="noop")])
+            kb_rows.append([InlineKeyboardButton(text=f"⏳ {course.name} (link pending){expiry}"[:64], callback_data="noop")])
     kb_rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="menu:main")])
 
     await call.message.edit_text("🧾 <b>My Courses</b>\n\nTap a course to join its group:",
@@ -1027,7 +1077,10 @@ async def _run_professor_ai(message: Message, user_id: int, user_text: str):
             owned_result = await session.execute(
                 select(Course.name)
                 .join(UserCourse, UserCourse.course_id == Course.id)
-                .where(UserCourse.user_id == user_id)
+                .where(
+                    UserCourse.user_id == user_id,
+                    or_(UserCourse.expires_at.is_(None), UserCourse.expires_at > datetime.utcnow()),
+                )
             )
             pending_result = await session.execute(
                 select(Course.name)
