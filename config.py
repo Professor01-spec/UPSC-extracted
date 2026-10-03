@@ -27,5 +27,8 @@ if not _raw_webapp_url:
 WEBAPP_BASE_URL = _raw_webapp_url
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "").strip()
+NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "").strip()
+NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "").strip()
+NOTION_API_VERSION = os.environ.get("NOTION_API_VERSION", "2022-06-28").strip()
 
 BOT_NAME = "UPSC Course Zone by Professor"

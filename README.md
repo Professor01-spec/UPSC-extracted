@@ -18,6 +18,9 @@ Bot service → **Variables** tab. Set these values there; do not commit them:
 | `WEBHOOK_SECRET_TOKEN` | Generate a random 1-256 character value using only letters, digits, `_`, and `-` |
 | `WEBAPP_BASE_URL` | Public HTTPS domain for the bot service; required for webhook setup |
 | `GEMINI_API_KEY` | Optional; required only for Gemini-powered features |
+| `NOTION_API_KEY` | Optional Notion internal integration secret; only used server-side for CA sync |
+| `NOTION_DATABASE_ID` | Optional ID of the Notion database shared with that integration |
+| `NOTION_API_VERSION` | Optional API version; defaults to `2022-06-28` |
 
 `PORT` and `RAILWAY_PUBLIC_DOMAIN` are provided by Railway. Without a valid `WEBHOOK_SECRET_TOKEN`, the service disables the Telegram webhook.
 
@@ -49,7 +52,11 @@ Variables save karne ke baad Railway khud redeploy karega. **Deployments** tab m
 
 An Admin can add a Notion product with `/adddatabase Name | https://www.notion.so/... | [price] | [days]`. Price defaults to ₹1,000 and duration to 365 days. Products appear under **Database Access**, use the existing reviewed payment flow, and expose their link only while the portal entitlement is active. Paid renewals extend an active term; expired terms restart from the approval date.
 
-The bot does not currently provision or revoke Notion workspace membership through Notion's API. If the configured URL is a public Notion share link, a user who saved or shared that URL may retain access after portal expiry. Strict revocable access requires a Notion workspace integration and private page permissions.
+CA and Notion use the same annual entitlement. The portal stores four independent datasets: `daily_ca`, `editorial`, `place_in_news`, and `international_orgs`. Users can browse with `/ca dataset | YYYY-MM-DD | topic | subtopic | keyword`, bookmark/read/revise records, and save private notes with `/canote`.
+
+For bidirectional sync, set `NOTION_API_KEY` and `NOTION_DATABASE_ID` in the server environment, invite the integration to the Notion database with read/insert/update permissions, then restart the bot. Admin commands are `/caadd`, `/notionsync`, `/notionstatus`, and `/notionresolve <record_id> portal|notion`. Pushes are queued and retried; pulls report success only after Notion returns a successful API response. Conflicts stay visible until an Admin selects a side.
+
+The Notion database must contain properties named `Title` (title), `Date` (date), `Dataset` (select), `Topic`, `Subtopic`, `Content`, `Source`, `UPSC Mapping`, `Prelims Mapping`, `Mains Mapping`, `PYQ Mapping`, and `Attachments` (rich text), `Tags` (multi-select), and `Source URL` / `Image URL` (URL). Add these `Dataset` select options: `daily_ca`, `editorial`, `place_in_news`, and `international_orgs`. The Notion API integration token does not provision or revoke individual workspace membership. A public share link may remain usable after portal expiry if a user saved or shared it; strict revocation needs private per-user Notion permissions outside this sync API.
 
 ## Referrals
 

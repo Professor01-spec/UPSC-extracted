@@ -28,6 +28,7 @@ from security import (
     _save_state_snapshot, daily_data_backup_task, morning_motivation_task,
     night_motivation_task, auto_delete_task, auto_delete_worker,
 )
+from notion_sync import notion_sync_worker
 from admin_handlers import AI_STATE
 import user_handlers
 import admin_handlers
@@ -108,6 +109,9 @@ USER_COMMANDS = [
     BotCommand(command="trending", description="Trending courses"),
     BotCommand(command="databases", description="Browse annual database access"),
     BotCommand(command="referral", description="Invite friends and track joins"),
+    BotCommand(command="ca", description="Browse current affairs"),
+    BotCommand(command="canote", description="Save a private CA note"),
+    BotCommand(command="cabookmarks", description="Review bookmarked CA"),
 ]
 
 ADMIN_COMMANDS = USER_COMMANDS + [
@@ -115,6 +119,10 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="addcourse", description="Add course (guided)"),
     BotCommand(command="quickadd", description="Add course (one message)"),
     BotCommand(command="adddatabase", description="Add annual Notion database access"),
+    BotCommand(command="caadd", description="Add a current-affairs record"),
+    BotCommand(command="notionsync", description="Run bidirectional CA sync"),
+    BotCommand(command="notionstatus", description="Check Notion sync queue"),
+    BotCommand(command="notionresolve", description="Resolve a Notion conflict"),
     BotCommand(command="addforall", description="Broadcast Ad to all groups (24h delete)"),
     BotCommand(command="grant", description="Manually unlock a course for a user"),
     BotCommand(command="price", description="Change a course's price"),
@@ -264,6 +272,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(morning_motivation_task(bot))
     asyncio.create_task(night_motivation_task(bot))
     asyncio.create_task(auto_delete_worker(bot))
+    asyncio.create_task(notion_sync_worker())
 
     yield
 

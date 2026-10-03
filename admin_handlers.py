@@ -3,7 +3,7 @@ import io
 import asyncio
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from html import escape
 from urllib.parse import urlparse
 from aiogram import Router, F
@@ -13,9 +13,10 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy import case, select, func, desc
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage, ConnectedChat, AuditEvent
+from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage, ConnectedChat, AuditEvent, CurrentAffair, NotionSyncJob, NotionSyncState
 from keyboards import AdminAddCourse, AdminBroadcast
 from config import ADMIN_ID
+from notion_sync import CA_DATASETS, enqueue_all_for_notion_push, enqueue_notion_push, notion_sync_configured, pull_notion_database
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -329,6 +330,7 @@ async def cmd_add_database(message: Message):
             group_link=access_url,
             is_active=True,
             access_duration_days=duration_days,
+            is_ca_notion_access=True,
         )
         session.add(product)
         await session.flush()
@@ -360,6 +362,195 @@ async def cmd_list_section_keys(message: Message):
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
         await message.answer(text[i:i + 3500])
+
+
+@router.message(Command("caadd"))
+async def cmd_add_current_affair(message: Message):
+    if not admin_only(message):
+        return
+    body = message.text.split(maxsplit=1)
+    usage = (
+        "Usage: /caadd dataset | YYYY-MM-DD | title | topic | content | source | source_url | "
+        "subtopic | tags | UPSC mapping | Prelims | Mains | PYQ | image_url | attachment_urls\n"
+        "Datasets: daily_ca, editorial, place_in_news, international_orgs"
+    )
+    if len(body) != 2:
+        await message.answer(usage)
+        return
+    fields = [field.strip() for field in body[1].split("|")]
+    if not 5 <= len(fields) <= 15:
+        await message.answer(usage)
+        return
+    fields.extend([""] * (15 - len(fields)))
+    dataset, date_text, title, topic, content = fields[:5]
+    source_name, source_url, subtopic, tags, upsc, prelims, mains, pyq, image_url, attachments = fields[5:15]
+    if dataset not in CA_DATASETS or not title or len(title) > 300 or not topic or len(topic) > 150:
+        await message.answer("Dataset, title, or topic is invalid.")
+        return
+    try:
+        affair_date = date.fromisoformat(date_text)
+    except ValueError:
+        await message.answer("Date must use YYYY-MM-DD.")
+        return
+    if not content or len(content) > 3000:
+        await message.answer("Content must be 1-3000 characters.")
+        return
+    for url in [source_url, image_url, *[value.strip() for value in attachments.split(",") if value.strip()]]:
+        if url:
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                await message.answer("Source, image, and attachment URLs must be HTTPS links without embedded credentials.")
+                return
+
+    async with async_session() as session:
+        affair = CurrentAffair(
+            dataset=dataset,
+            affair_date=affair_date,
+            title=title,
+            topic=topic,
+            subtopic=subtopic or None,
+            tags=tags or None,
+            content=content,
+            source_name=source_name or None,
+            source_url=source_url or None,
+            upsc_mapping=upsc or None,
+            prelims_mapping=prelims or None,
+            mains_mapping=mains or None,
+            pyq_mapping=pyq or None,
+            image_url=image_url or None,
+            attachments=attachments or None,
+        )
+        session.add(affair)
+        await session.flush()
+        queued = await enqueue_notion_push(session, affair.id)
+        session.add(AuditEvent(
+            actor_id=message.from_user.id,
+            action="ca.record.created",
+            target_type="current_affair",
+            target_id=str(affair.id),
+        ))
+        await session.commit()
+
+    sync_status = "Notion push queued; it is not confirmed until the API accepts it." if queued else "Notion sync is not configured; this record is portal-only for now."
+    await message.answer(f"✅ CA record #{affair.id} added to {dataset}. {sync_status}")
+
+
+@router.message(Command("notionsync"))
+async def cmd_notion_sync(message: Message):
+    if not admin_only(message):
+        return
+    if not notion_sync_configured():
+        await message.answer("Notion sync is not configured. Set NOTION_API_KEY and NOTION_DATABASE_ID in the server environment.")
+        return
+    queued = await enqueue_all_for_notion_push()
+    try:
+        pulled = await pull_notion_database()
+    except Exception:
+        logger.exception("Notion pull failed")
+        async with async_session() as session:
+            session.add(AuditEvent(
+                actor_id=message.from_user.id,
+                action="notion.sync.failed",
+                target_type="notion_database",
+                target_id="configured_database",
+            ))
+            await session.commit()
+        await message.answer(
+            f"Portal export jobs queued: {queued}. Notion pull failed; no pull success is reported. "
+            "The sync worker will retry queued exports."
+        )
+        return
+    async with async_session() as session:
+        session.add(AuditEvent(
+            actor_id=message.from_user.id,
+            action="notion.pull.succeeded",
+            target_type="notion_database",
+            target_id="configured_database",
+        ))
+        await session.commit()
+    await message.answer(
+        "✅ Notion pull confirmed by the API. "
+        f"Imported {pulled['imported']}, updated {pulled['updated']}, conflicts {pulled['conflicts']}, "
+        f"skipped {pulled['skipped']}. Portal push jobs queued: {queued}; those complete asynchronously."
+    )
+
+
+@router.message(Command("notionstatus"))
+async def cmd_notion_status(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        counts = {}
+        for status in ("pending", "processing", "failed", "conflict", "synced"):
+            counts[status] = await session.scalar(
+                select(func.count(NotionSyncJob.id)).where(NotionSyncJob.status == status)
+            ) or 0
+        pull_state = await session.get(NotionSyncState, 1)
+    pull_summary = (
+        f"Last pull: {pull_state.last_pull_status} at {pull_state.last_pull_at}\n"
+        f"Imported {pull_state.imported}, updated {pull_state.updated}, conflicts {pull_state.conflicts}, "
+        f"skipped {pull_state.skipped}, error {pull_state.last_error or 'none'}"
+        if pull_state and pull_state.last_pull_at else "No Notion pull has completed yet."
+    )
+    await message.answer(
+        f"Notion configured: {'Yes' if notion_sync_configured() else 'No'}\n"
+        + pull_summary + "\n"
+        + "\n".join(f"{status.title()}: {count}" for status, count in counts.items())
+    )
+
+
+@router.message(Command("notionresolve"))
+async def cmd_notion_resolve(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 3 or parts[2] not in ("portal", "notion"):
+        await message.answer("Usage: /notionresolve <ca_record_id> portal|notion")
+        return
+    record_id, error = _parse_id(parts[1])
+    if error:
+        await message.answer(error)
+        return
+    async with async_session() as session:
+        record = await session.get(CurrentAffair, record_id)
+        job = await session.scalar(
+            select(NotionSyncJob).where(
+                NotionSyncJob.affair_id == record_id,
+                NotionSyncJob.direction == "push",
+                NotionSyncJob.status == "conflict",
+            )
+        )
+        if not record or not job:
+            await message.answer("No unresolved Notion conflict exists for that record.")
+            return
+        if parts[2] == "portal":
+            job.status = "pending"
+            job.attempts = 0
+            job.force_portal = True
+            job.last_error = "force_portal"
+            job.next_attempt_at = datetime.utcnow()
+        else:
+            if not record.notion_page_id:
+                await message.answer("The Notion page is missing; portal version retained for manual recovery.")
+                return
+            record.last_synced_at = datetime.utcnow()
+            record.portal_dirty = False
+        session.add(AuditEvent(
+            actor_id=message.from_user.id,
+            action=f"notion.conflict.resolved.{parts[2]}",
+            target_type="current_affair",
+            target_id=str(record_id),
+        ))
+        await session.commit()
+    if parts[2] == "notion":
+        try:
+            result = await pull_notion_database()
+        except Exception:
+            await message.answer("Notion version was selected, but the pull failed; retry /notionsync. No sync success is reported.")
+            return
+        await message.answer(f"Notion version applied after confirmed pull. Updated {result['updated']} records.")
+    else:
+        await message.answer("Portal version selected. A retryable Notion push is queued.")
 
 
 # ================= MANUAL GRANT =================
@@ -1224,6 +1415,8 @@ async def cmd_admin_help(message: Message):
         "/restart — Clear temporary cache (no data lost)\n\n"
         "<b>Courses</b>\n"
         "/adddatabase Name | Notion URL | [price] | [days] — create time-limited database access\n"
+        "/caadd dataset | date | title | topic | content | ... — add a CA record\n"
+        "/notionsync, /notionstatus, /notionresolve — sync and review Notion state\n"
         "/addcourse — add a new course (step-by-step)\n"
         "/quickadd Name | Faculty | Medium | Notes | Price|TBD | section_keys — add a course in ONE message\n"
         "/listsectionkeys — see all section keys (for /quickadd, /movecourse)\n"

@@ -5,7 +5,7 @@ catalog seed, all in one file.
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Text, Boolean, ForeignKey,
-    DateTime, Table, Numeric, UniqueConstraint, select
+    Date, DateTime, Table, Numeric, UniqueConstraint, select
 )
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -51,6 +51,7 @@ class Course(Base):
     is_active = Column(Boolean, default=True)
     is_seeded = Column(Boolean, default=False, nullable=False)
     access_duration_days = Column(Integer, nullable=True)
+    is_ca_notion_access = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     sections = relationship("Section", secondary=course_sections, back_populates="courses", lazy="selectin")
@@ -158,6 +159,78 @@ class ScheduledDeletion(Base):
     message_id = Column(Integer, nullable=False)
     delete_at = Column(DateTime, nullable=False)
     attempts = Column(Integer, default=0, nullable=False)
+
+
+class CurrentAffair(Base):
+    __tablename__ = "current_affairs"
+
+    id = Column(Integer, primary_key=True)
+    dataset = Column(String(32), nullable=False, index=True)
+    affair_date = Column(Date, nullable=False, index=True)
+    title = Column(String(300), nullable=False)
+    topic = Column(String(150), nullable=False, index=True)
+    subtopic = Column(String(150), nullable=True)
+    tags = Column(Text, nullable=True)
+    content = Column(Text, nullable=False)
+    source_name = Column(String(200), nullable=True)
+    source_url = Column(Text, nullable=True)
+    upsc_mapping = Column(Text, nullable=True)
+    prelims_mapping = Column(Text, nullable=True)
+    mains_mapping = Column(Text, nullable=True)
+    pyq_mapping = Column(Text, nullable=True)
+    attachments = Column(Text, nullable=True)
+    image_url = Column(Text, nullable=True)
+    notion_page_id = Column(String(64), nullable=True, unique=True)
+    notion_edited_at = Column(DateTime, nullable=True)
+    last_synced_at = Column(DateTime, nullable=True)
+    portal_dirty = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+
+class CAUserState(Base):
+    __tablename__ = "ca_user_states"
+    __table_args__ = (UniqueConstraint("user_id", "affair_id", name="uq_ca_user_affair"),)
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    affair_id = Column(Integer, ForeignKey("current_affairs.id", ondelete="CASCADE"), nullable=False)
+    is_bookmarked = Column(Boolean, default=False, nullable=False)
+    is_read = Column(Boolean, default=False, nullable=False)
+    notes = Column(Text, nullable=True)
+    revision_state = Column(String(32), default="new", nullable=False)
+    last_viewed_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class NotionSyncJob(Base):
+    __tablename__ = "notion_sync_jobs"
+    __table_args__ = (UniqueConstraint("affair_id", "direction", name="uq_notion_job_affair_direction"),)
+
+    id = Column(Integer, primary_key=True)
+    affair_id = Column(Integer, ForeignKey("current_affairs.id", ondelete="CASCADE"), nullable=False)
+    direction = Column(String(8), nullable=False)
+    status = Column(String(16), default="pending", nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+    force_portal = Column(Boolean, default=False, nullable=False)
+    next_attempt_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_error = Column(String(300), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class NotionSyncState(Base):
+    __tablename__ = "notion_sync_state"
+
+    id = Column(Integer, primary_key=True)
+    last_pull_at = Column(DateTime, nullable=True)
+    last_pull_status = Column(String(16), nullable=True)
+    imported = Column(Integer, default=0, nullable=False)
+    updated = Column(Integer, default=0, nullable=False)
+    conflicts = Column(Integer, default=0, nullable=False)
+    skipped = Column(Integer, default=0, nullable=False)
+    last_error = Column(String(64), nullable=True)
 
 
 # ---------------- engine / session ----------------
@@ -529,6 +602,13 @@ async def migrate_v6():
         )
         await conn.exec_driver_sql(
             "ALTER TABLE courses ADD COLUMN IF NOT EXISTS access_duration_days INTEGER NULL"
+        )
+        await conn.exec_driver_sql(
+            "ALTER TABLE courses ADD COLUMN IF NOT EXISTS is_ca_notion_access BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        await conn.exec_driver_sql(
+            "UPDATE courses SET is_ca_notion_access = TRUE "
+            "WHERE faculty = 'Notion Database' AND access_duration_days IS NOT NULL"
         )
         await conn.exec_driver_sql(
             "ALTER TABLE user_courses ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP NULL"
