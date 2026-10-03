@@ -108,6 +108,7 @@ class AdminAddCourse(StatesGroup):
 
 class AdminBroadcast(StatesGroup):
     waiting_message = State()
+    confirming = State()
 
 
 class ContactFlow(StatesGroup):

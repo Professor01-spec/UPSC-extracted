@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from html import escape
 from urllib.parse import urlparse
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, BufferedInputFile, ChatMemberUpdated
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import case, select, func, desc
@@ -1416,26 +1416,121 @@ async def cb_reject(call: CallbackQuery):
 async def cmd_broadcast(message: Message, state: FSMContext):
     if not admin_only(message):
         return
+    await state.clear()
     await state.set_state(AdminBroadcast.waiting_message)
-    await message.answer("📢 Send the broadcast message (text/photo/anything) — it will go to all users:")
+    await message.answer(
+        "📢 Send up to 10 text/media messages to include, then /done to preview or /cancel to stop. "
+        "Nothing is sent until you confirm."
+    )
+
+
+@router.message(AdminBroadcast.waiting_message, Command("cancel"))
+async def cancel_broadcast_collection(message: Message, state: FSMContext):
+    if not admin_only(message):
+        await state.clear()
+        return
+    await state.clear()
+    await message.answer("Broadcast cancelled; nothing was sent.")
+
+
+@router.message(AdminBroadcast.waiting_message, Command("done"))
+async def finish_broadcast_collection(message: Message, state: FSMContext):
+    if not admin_only(message):
+        await state.clear()
+        return
+    data = await state.get_data()
+    items = data.get("items", [])
+    if not items:
+        await message.answer("No messages collected. Send a message first or /cancel.")
+        return
+    await state.set_state(AdminBroadcast.confirming)
+    await message.answer(
+        f"Preview: {len(items)} message(s) will be copied to each known unbanned user. Confirm send?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Send broadcast", callback_data="broadcast:confirm"),
+            InlineKeyboardButton(text="Cancel", callback_data="broadcast:cancel"),
+        ]]),
+    )
 
 
 @router.message(AdminBroadcast.waiting_message)
-async def do_broadcast(message: Message, state: FSMContext):
+async def collect_broadcast_message(message: Message, state: FSMContext):
+    if not admin_only(message):
+        await state.clear()
+        return
+    data = await state.get_data()
+    source_chat_id = data.get("source_chat_id")
+    if source_chat_id is not None and source_chat_id != message.chat.id:
+        await message.answer("Continue collecting in the same private chat where /broadcast was started.")
+        return
+    items = data.get("items", [])
+    if len(items) >= 10:
+        await message.answer("Batch limit is 10 messages. Send /done to preview or /cancel to stop.")
+        return
+    items.append(message.message_id)
+    await state.update_data(source_chat_id=message.chat.id, items=items)
+    await message.answer(f"Added {len(items)}/10. Send another message, /done to preview, or /cancel.")
+
+
+@router.callback_query(F.data == "broadcast:cancel", AdminBroadcast.confirming)
+async def cancel_broadcast_confirmation(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Admin only.", show_alert=True)
+        return
+    await state.clear()
+    await call.message.edit_text("Broadcast cancelled; nothing was sent.")
+    await call.answer()
+
+
+@router.callback_query(F.data == "broadcast:confirm", AdminBroadcast.confirming)
+async def confirm_broadcast(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Admin only.", show_alert=True)
+        return
+    data = await state.get_data()
+    items = data.get("items", [])
+    source_chat_id = data.get("source_chat_id")
+    if not items or not source_chat_id:
+        await state.clear()
+        await call.answer("Broadcast draft expired. Start /broadcast again.", show_alert=True)
+        return
     await state.clear()
     async with async_session() as session:
         result = await session.execute(select(User.id).where(User.is_banned == False))  # noqa: E712
         user_ids = [row[0] for row in result.all()]
 
-    sent, failed = 0, 0
-    status_msg = await message.answer(f"📤 Sending... 0/{len(user_ids)}")
+    sent_users, failed_users, sent_messages = 0, 0, 0
+    status_msg = await call.message.edit_text(f"📤 Sending {len(items)} message(s) to {len(user_ids)} users…")
     for uid in user_ids:
+        user_ok = True
         try:
-            await message.copy_to(chat_id=uid)
-            sent += 1
+            for message_id in items:
+                await call.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=source_chat_id,
+                    message_id=message_id,
+                )
+                sent_messages += 1
+                await asyncio.sleep(0.04)
         except Exception:
-            failed += 1
-    await status_msg.edit_text(f"✅ Broadcast complete!\nSent: {sent} | Failed: {failed}")
+            user_ok = False
+        if user_ok:
+            sent_users += 1
+        else:
+            failed_users += 1
+    async with async_session() as session:
+        session.add(AuditEvent(
+            actor_id=call.from_user.id,
+            action="broadcast.completed",
+            target_type="broadcast",
+            target_id=f"{len(items)}_items_{sent_users}_users",
+        ))
+        await session.commit()
+    await status_msg.edit_text(
+        f"✅ Broadcast complete. Users reached: {sent_users}; failed users: {failed_users}; "
+        f"messages delivered: {sent_messages}."
+    )
+    await call.answer("Broadcast finished")
 
 
 # ================= STATS =================
@@ -1633,7 +1728,7 @@ async def cmd_admin_help(message: Message):
         "Just hit Reply (Telegram's native reply) on any forwarded order or "
         "'Contact Professor' message — your reply is delivered to that user automatically.\n\n"
         "<b>Broadcast &amp; Stats</b>\n"
-        "/broadcast — message all users\n"
+        "/broadcast — collect up to 10 messages, /done to preview, confirm to send\n"
         "/stats — bot-wide numbers",
         parse_mode="HTML"
     )

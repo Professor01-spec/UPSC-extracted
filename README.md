@@ -66,8 +66,14 @@ The Notion database must contain properties named `Title` (title), `Date` (date)
 
 Users can open **Invite Friends** or use `/referral` to get an opaque invite link and see attributed new-user joins. Attribution is immutable after a user is created. Referral rewards are not issued until an explicit reward policy is configured.
 
+## Admin broadcasts
+
+Use `/broadcast`, send up to 10 messages/media items, then `/done` to preview. The broadcast only starts after pressing **Send broadcast**; `/cancel` discards the draft. Each item is copied to known, unbanned users and bot-sent copies are scheduled for deletion after 24 hours.
+
 ## Vercel
 
-This checkout is not currently configured as a Vercel deployment: it has no Vercel function configuration, and its webhook app starts long-running workers for Notion retries, deletion scheduling, backups, and broadcasts. Vercel functions are not a persistent worker host, so adding a routing file alone would silently break these jobs. Use the existing persistent-process deployment, or first move workers to a durable external queue/scheduler and validate the serverless webhook lifecycle.
+`vercel.json` and `api/index.py` route requests to the existing FastAPI app. Configure `BOT_TOKEN`, `ADMIN_ID`, `DATABASE_URL`, `WEBHOOK_SECRET_TOKEN`, `WEBAPP_BASE_URL`, and any Gemini/Notion settings in Vercel Project Settings; set `WEBAPP_BASE_URL` to the deployed HTTPS domain.
+
+This adapter serves request/response routes, but the app also starts long-running workers for Notion retries, deletion scheduling, backups, and broadcasts. Vercel functions may freeze or terminate after a response, so those workers are not production-reliable there without a durable external queue/scheduler or persistent worker host. The routing files alone do not make the full bot production-ready on Vercel.
 
 Koi error aaye Railway ke **Deployments → Logs** me, wahi paste kar dena — turant fix karunga.

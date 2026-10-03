@@ -136,7 +136,7 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="pending", description="Pending orders"),
     BotCommand(command="userinfo", description="Look up a user"),
     BotCommand(command="stats", description="Bot stats"),
-    BotCommand(command="broadcast", description="Message all users"),
+    BotCommand(command="broadcast", description="Send up to 10 messages to users"),
     # Previously missing from this menu (commands existed in admin_handlers.py
     # and worked fine if typed manually, but never showed up in Telegram's "/"
     # autocomplete list since they were never added here).
