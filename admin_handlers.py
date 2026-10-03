@@ -29,6 +29,117 @@ def admin_only(message: Message) -> bool:
     return message.from_user.id == ADMIN_ID
 
 
+async def _resync_known_registry(bot, actor_id: int) -> tuple[int, int, int, int, int, int]:
+    bot_id = (await bot.get_me()).id
+    async with async_session() as session:
+        total_users = await session.scalar(select(func.count(User.id))) or 0
+        chats = (await session.execute(select(ConnectedChat).order_by(ConnectedChat.id))).scalars().all()
+        checked = active = removed = failures = 0
+        for index, chat in enumerate(chats, 1):
+            try:
+                member = await bot.get_chat_member(chat_id=chat.id, user_id=bot_id)
+            except Exception:
+                failures += 1
+                continue
+            checked += 1
+            still_member = member.status in ("member", "administrator", "creator") or (
+                member.status == "restricted" and getattr(member, "is_member", False)
+            )
+            if still_member:
+                active += 1
+                if chat.type in ("group", "supergroup"):
+                    try:
+                        await bot.set_chat_message_auto_delete_time(
+                            chat_id=chat.id,
+                            message_auto_delete_time=0,
+                        )
+                    except Exception:
+                        failures += 1
+            elif member.status in ("left", "kicked") or (
+                member.status == "restricted" and not getattr(member, "is_member", False)
+            ):
+                await session.delete(chat)
+                removed += 1
+            if index % 20 == 0:
+                await asyncio.sleep(0.1)
+        session.add(AuditEvent(
+            actor_id=actor_id,
+            action="system.registry.resynced",
+            target_type="telegram_registry",
+            target_id="known_records",
+        ))
+        await session.commit()
+    return total_users, len(chats), checked, active, removed, failures
+
+
+@router.message(Command("resync"))
+async def cmd_resync(message: Message):
+    if not admin_only(message):
+        return
+    try:
+        users, known_chats, checked, active, removed, failures = await _resync_known_registry(
+            message.bot, message.from_user.id
+        )
+    except Exception:
+        logger.exception("Known registry resync failed")
+        await message.answer("Registry rescan failed. Existing records were preserved; check server logs and retry.")
+        return
+    await message.answer(
+        "✅ <b>Known registry rescan complete</b>\n"
+        f"Users already stored: {users}\n"
+        f"Known chats checked: {checked}/{known_chats}\n"
+        f"Active groups/channels: {active}\n"
+        f"Stale chat records removed: {removed}\n"
+        f"Permission/API failures: {failures}\n\n"
+        "Telegram cannot enumerate users who never opened the bot or groups it has never observed."
+    )
+
+
+@router.message(Command("chatadd"))
+async def cmd_add_existing_chat(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /chatadd <existing_group_or_channel_id>")
+        return
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        await message.answer("Chat ID must be numeric.")
+        return
+    if chat_id == 0 or abs(chat_id) > 9_223_372_036_854_775_807:
+        await message.answer("Chat ID is outside the valid range.")
+        return
+    try:
+        chat = await message.bot.get_chat(chat_id)
+        bot_id = (await message.bot.get_me()).id
+        membership = await message.bot.get_chat_member(chat_id=chat_id, user_id=bot_id)
+    except Exception:
+        await message.answer("Telegram could not verify bot access to that chat; no registry entry was added.")
+        return
+    still_member = membership.status in ("member", "administrator", "creator") or (
+        membership.status == "restricted" and getattr(membership, "is_member", False)
+    )
+    if not still_member:
+        await message.answer("The bot is not currently a member of that chat.")
+        return
+    async with async_session() as session:
+        await session.execute(
+            pg_insert(ConnectedChat)
+            .values(id=chat_id, type=chat.type)
+            .on_conflict_do_update(index_elements=["id"], set_={"type": chat.type})
+        )
+        session.add(AuditEvent(
+            actor_id=message.from_user.id,
+            action="system.chat.registered",
+            target_type="telegram_chat",
+            target_id=str(chat_id),
+        ))
+        await session.commit()
+    await message.answer(f"✅ Verified and registered this {chat.type}. It will be included in future group broadcasts.")
+
+
 def uid_tag(user_id: int) -> str:
     """User ID wrapped so a single tap copies it in Telegram."""
     return f"<code>{user_id}</code>"
@@ -60,7 +171,10 @@ async def on_bot_added_to_chat(event: ChatMemberUpdated):
         chat = await session.get(ConnectedChat, event.chat.id)
         
         # If bot is added and made member/admin
-        if event.new_chat_member.status in ["member", "administrator", "creator"]:
+        still_member = event.new_chat_member.status in ["member", "administrator", "creator"] or (
+            event.new_chat_member.status == "restricted" and getattr(event.new_chat_member, "is_member", False)
+        )
+        if still_member:
             if not chat:
                 session.add(ConnectedChat(id=event.chat.id, type=event.chat.type))
                 await session.commit()
@@ -74,7 +188,9 @@ async def on_bot_added_to_chat(event: ChatMemberUpdated):
                     logger.info("Group-wide auto-delete could not be disabled; check bot admin permissions")
                 
         # If bot is removed or kicked
-        elif event.new_chat_member.status in ["left", "kicked", "restricted"]:
+        elif event.new_chat_member.status in ["left", "kicked"] or (
+            event.new_chat_member.status == "restricted" and not getattr(event.new_chat_member, "is_member", False)
+        ):
             if chat:
                 await session.delete(chat)
                 await session.commit()
@@ -442,9 +558,29 @@ async def cmd_notion_sync(message: Message):
     if not notion_sync_configured():
         await message.answer("Notion sync is not configured. Set NOTION_API_KEY and NOTION_DATABASE_ID in the server environment.")
         return
-    queued = await enqueue_all_for_notion_push()
+    filters = {}
+    for part in message.text.split()[1:]:
+        key, separator, value = part.partition("=")
+        if not separator or key not in ("dataset", "from", "to") or not value:
+            await message.answer("Usage: /notionsync [dataset=daily_ca] [from=YYYY-MM-DD] [to=YYYY-MM-DD]")
+            return
+        if key == "dataset":
+            if value not in CA_DATASETS:
+                await message.answer("Unknown dataset. Use daily_ca, editorial, place_in_news, or international_orgs.")
+                return
+            filters["dataset"] = value
+        else:
+            try:
+                filters["date_from" if key == "from" else "date_to"] = date.fromisoformat(value)
+            except ValueError:
+                await message.answer("Sync dates must use YYYY-MM-DD.")
+                return
+    if filters.get("date_from") and filters.get("date_to") and filters["date_from"] > filters["date_to"]:
+        await message.answer("The 'from' date must not be after the 'to' date.")
+        return
+    queued = await enqueue_all_for_notion_push(**filters)
     try:
-        pulled = await pull_notion_database()
+        pulled = await pull_notion_database(**filters)
     except Exception:
         logger.exception("Notion pull failed")
         async with async_session() as session:
@@ -470,6 +606,7 @@ async def cmd_notion_sync(message: Message):
         await session.commit()
     await message.answer(
         "✅ Notion pull confirmed by the API. "
+        f"Filter: {filters or 'all datasets / dates'}. "
         f"Imported {pulled['imported']}, updated {pulled['updated']}, conflicts {pulled['conflicts']}, "
         f"skipped {pulled['skipped']}. Portal push jobs queued: {queued}; those complete asynchronously."
     )
@@ -1314,12 +1451,54 @@ async def cmd_stats(message: Message):
         approved_orders = (await session.execute(select(func.count(Order.id)).where(Order.status == "approved"))).scalar()
         rejected_orders = (await session.execute(select(func.count(Order.id)).where(Order.status == "rejected"))).scalar()
         total_sales = (await session.execute(select(func.count(UserCourse.id)))).scalar()
+        active_today = (await session.execute(
+            select(func.count(func.distinct(UserActivity.user_id)))
+            .where(UserActivity.created_at >= datetime.utcnow() - timedelta(days=1))
+        )).scalar()
+        active_week = (await session.execute(
+            select(func.count(func.distinct(UserActivity.user_id)))
+            .where(UserActivity.created_at >= datetime.utcnow() - timedelta(days=7))
+        )).scalar()
+        new_users_week = (await session.execute(
+            select(func.count(User.id)).where(User.joined_at >= datetime.utcnow() - timedelta(days=7))
+        )).scalar()
+        referral_joins = (await session.execute(
+            select(func.count(User.id)).where(User.referred_by.is_not(None))
+        )).scalar()
+        active_database_access = (await session.execute(
+            select(func.count(UserCourse.id))
+            .join(Course, UserCourse.course_id == Course.id)
+            .where(
+                Course.is_ca_notion_access == True,
+                Course.is_active == True,
+                (UserCourse.expires_at.is_(None) | (UserCourse.expires_at > datetime.utcnow())),
+            )
+        )).scalar()
+        ca_rows = await session.execute(
+            select(CurrentAffair.dataset, func.count(CurrentAffair.id))
+            .where(CurrentAffair.is_active == True)
+            .group_by(CurrentAffair.dataset)
+        )
+        ca_counts = {dataset: count for dataset, count in ca_rows.all()}
+        notion_pending = (await session.execute(
+            select(func.count(NotionSyncJob.id)).where(NotionSyncJob.status.in_(("pending", "processing", "failed")))
+        )).scalar()
+        notion_conflicts = (await session.execute(
+            select(func.count(NotionSyncJob.id)).where(NotionSyncJob.status == "conflict")
+        )).scalar()
+        support_messages = (await session.execute(select(func.count(ContactMessage.id)))).scalar()
 
     await message.answer(
         "📊 <b>Bot Stats</b>\n\n"
         f"👥 Total Users: {total_users}\n🚫 Banned: {banned}\n📘 Active Courses: {total_courses}\n\n"
         f"⏳ Pending Orders: {pending_orders}\n✅ Approved: {approved_orders}\n❌ Rejected: {rejected_orders}\n"
-        f"🎓 Total Course Grants: {total_sales}"
+        f"🎓 Total Course Grants: {total_sales}\n"
+        f"📈 Active users (24h / 7d): {active_today} / {active_week}\n"
+        f"🆕 New users (7d): {new_users_week}\n🔗 Attributed referral joins: {referral_joins}\n"
+        f"🗂 Active CA/Notion entitlements: {active_database_access}\n"
+        f"📰 CA records: {ca_counts or 'none'}\n"
+        f"🔄 Notion queued/failed: {notion_pending} | conflicts: {notion_conflicts}\n"
+        f"💬 Stored support messages: {support_messages}"
     )
 
 
@@ -1370,13 +1549,16 @@ async def cmd_unban(message: Message):
 
 @router.message(Command("restart"))
 async def cmd_restart(message: Message):
-    """NOT a process restart — a safe 'cache clean', same idea as a phone cleaner
-    app: clears only short-lived, self-expiring in-memory trackers (spam/burst
-    rate-limit windows, Professor-AI chat cooldowns, broadcast-reply counters).
-    Deliberately does NOT touch: the database (courses/orders/users/payments),
-    shadow-bans/freezes/mutes, or the persisted /toggle_ai state — nothing real
-    is ever lost, exactly as requested."""
+    """Revalidate known Telegram registry records and clear temporary rate-limit caches."""
     if not admin_only(message):
+        return
+    try:
+        users, known_chats, checked, active, removed, failures = await _resync_known_registry(
+            message.bot, message.from_user.id
+        )
+    except Exception:
+        logger.exception("Registry resync during /restart failed")
+        await message.answer("Registry rescan failed; no cache or persistent data was changed. Retry with /resync.")
         return
     from security import burst_monitor, spam_monitor
     # Deferred import (not at module top) to avoid a circular import: user_handlers
@@ -1395,8 +1577,9 @@ async def cmd_restart(message: Message):
         f"🧹 <b>Cache Cleared</b>\n\n"
         f"Cleared <b>{cleared}</b> temporary entries — spam/burst rate-limit windows, "
         f"AI chat cooldowns, broadcast-reply counters.\n\n"
-        f"✅ Koi user data, course, order, ya security ban touch nahi hua — sirf "
-        f"temporary cache clean hui hai, mobile cleaner jaise.",
+        f"Registry: {users} stored users; {checked}/{known_chats} known chats checked; "
+        f"{active} active, {removed} stale removed, {failures} API/permission failures.\n"
+        "Telegram cannot enumerate users/groups it has never observed. Orders and entitlements were not changed.",
         parse_mode="HTML"
     )
 
@@ -1410,13 +1593,16 @@ async def cmd_admin_help(message: Message):
         "<b>New Premium Features</b>\n"
         "/toggle_ai — Turn Auto-Reply ON/OFF\n"
         "/createpromo &lt;CODE&gt; &lt;PERCENT&gt; — Create Flash Sale discount\n"
-        "/addforall — Broadcast Ad to all groups (72h delete)\n"
+        "/addforall — Broadcast Ad to all groups (bot messages delete after 24h)\n"
         "/weekly_report — Generate AI Business Report\n"
         "/restart — Clear temporary cache (no data lost)\n\n"
+        "/resync — refresh previously stored users/groups/channels\n"
+        "/chatadd &lt;chat_id&gt; — register a group the bot already belongs to\n"
         "<b>Courses</b>\n"
         "/adddatabase Name | Notion URL | [price] | [days] — create time-limited database access\n"
         "/caadd dataset | date | title | topic | content | ... — add a CA record\n"
-        "/notionsync, /notionstatus, /notionresolve — sync and review Notion state\n"
+        "/notionsync [dataset=...] [from=YYYY-MM-DD] [to=YYYY-MM-DD] — filtered sync\n"
+        "/notionstatus, /notionresolve — review Notion state/conflicts\n"
         "/addcourse — add a new course (step-by-step)\n"
         "/quickadd Name | Faculty | Medium | Notes | Price|TBD | section_keys — add a course in ONE message\n"
         "/listsectionkeys — see all section keys (for /quickadd, /movecourse)\n"

@@ -149,13 +149,36 @@ async def _push_record(client: httpx.AsyncClient, record: CurrentAffair, force_p
     return "synced"
 
 
-async def _pull_database(client: httpx.AsyncClient) -> dict:
+def _notion_filter(dataset: str | None = None, date_from: date | None = None, date_to: date | None = None) -> dict | None:
+    filters = []
+    if dataset:
+        if dataset not in CA_DATASETS:
+            raise ValueError("invalid_dataset")
+        filters.append({"property": "Dataset", "select": {"equals": dataset}})
+    if date_from:
+        filters.append({"property": "Date", "date": {"on_or_after": date_from.isoformat()}})
+    if date_to:
+        filters.append({"property": "Date", "date": {"on_or_before": date_to.isoformat()}})
+    if not filters:
+        return None
+    return filters[0] if len(filters) == 1 else {"and": filters}
+
+
+async def _pull_database(
+    client: httpx.AsyncClient,
+    dataset: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> dict:
     cursor = None
     imported = updated = conflicts = skipped = 0
+    notion_filter = _notion_filter(dataset, date_from, date_to)
     while True:
         payload = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
+        if notion_filter:
+            payload["filter"] = notion_filter
         response = await _notion_request(
             client, "POST", f"/databases/{NOTION_DATABASE_ID}/query", json=payload
         )
@@ -225,7 +248,11 @@ async def _pull_database(client: httpx.AsyncClient) -> dict:
     return {"imported": imported, "updated": updated, "conflicts": conflicts, "skipped": skipped}
 
 
-async def pull_notion_database() -> dict:
+async def pull_notion_database(
+    dataset: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> dict:
     if not notion_sync_configured():
         raise RuntimeError("notion_not_configured")
     headers = {
@@ -235,7 +262,7 @@ async def pull_notion_database() -> dict:
     }
     try:
         async with httpx.AsyncClient(timeout=30, headers=headers) as client:
-            result = await _pull_database(client)
+            result = await _pull_database(client, dataset, date_from, date_to)
     except Exception as error:
         async with async_session() as session:
             state = await session.get(NotionSyncState, 1)
@@ -263,13 +290,26 @@ async def pull_notion_database() -> dict:
     return result
 
 
-async def enqueue_all_for_notion_push() -> int:
+async def enqueue_all_for_notion_push(
+    dataset: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> int:
     if not notion_sync_configured():
         raise RuntimeError("notion_not_configured")
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     async with async_session() as session:
-        result = await session.execute(select(CurrentAffair.id))
+        conditions = []
+        if dataset:
+            if dataset not in CA_DATASETS:
+                raise ValueError("invalid_dataset")
+            conditions.append(CurrentAffair.dataset == dataset)
+        if date_from:
+            conditions.append(CurrentAffair.affair_date >= date_from)
+        if date_to:
+            conditions.append(CurrentAffair.affair_date <= date_to)
+        result = await session.execute(select(CurrentAffair.id).where(*conditions))
         affair_ids = [row[0] for row in result.all()]
         if affair_ids:
             for affair_id in affair_ids:
