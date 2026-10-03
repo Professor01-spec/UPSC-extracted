@@ -135,6 +135,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🏢 All State PSC", callback_data="topsec:state_psc")],
         [InlineKeyboardButton(text="🔍 Search Course", callback_data="allcourses:open")],
         [InlineKeyboardButton(text="🗂 Database Access", callback_data="databases:open")],
+        [InlineKeyboardButton(text="🔗 Invite Friends", callback_data="referral:open")],
         [InlineKeyboardButton(text="⭐ Chat with Professor AI — Instant Search", callback_data="professor_ai:open")],
         [InlineKeyboardButton(text="🧾 My Courses", callback_data="mycourses:open")],
         [InlineKeyboardButton(text="💬 Contact Professor", callback_data="contact:open")],

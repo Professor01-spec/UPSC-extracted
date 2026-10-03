@@ -51,6 +51,10 @@ An Admin can add a Notion product with `/adddatabase Name | https://www.notion.s
 
 The bot does not currently provision or revoke Notion workspace membership through Notion's API. If the configured URL is a public Notion share link, a user who saved or shared that URL may retain access after portal expiry. Strict revocable access requires a Notion workspace integration and private page permissions.
 
+## Referrals
+
+Users can open **Invite Friends** or use `/referral` to get an opaque invite link and see attributed new-user joins. Attribution is immutable after a user is created. Referral rewards are not issued until an explicit reward policy is configured.
+
 ## Vercel
 
 This checkout is not currently configured as a Vercel deployment: it has no Vercel function configuration, and its bot starts background tasks intended for a persistent process. Do not treat a successful GitHub push as a Vercel-ready deployment. A serverless lifecycle and scheduled-task design must be validated before deploying it there.

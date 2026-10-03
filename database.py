@@ -66,6 +66,8 @@ class User(Base):
     is_banned = Column(Boolean, default=False)
     has_joined_backup_channel = Column(Boolean, default=False)
     backup_channel_checked_at = Column(DateTime, nullable=True)
+    referral_code = Column(String(32), unique=True, nullable=True)
+    referred_by = Column(BigInteger, ForeignKey("users.id"), nullable=True)
 
 
 class Order(Base):
@@ -530,4 +532,18 @@ async def migrate_v6():
         )
         await conn.exec_driver_sql(
             "ALTER TABLE user_courses ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP NULL"
+        )
+
+
+async def migrate_v7():
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(32) NULL"
+        )
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT NULL REFERENCES users(id)"
+        )
+        await conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_referral_code "
+            "ON users (referral_code) WHERE referral_code IS NOT NULL"
         )

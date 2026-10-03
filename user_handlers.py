@@ -3,6 +3,7 @@ import hashlib
 import logging
 import asyncio
 import re
+import secrets
 import time
 from datetime import datetime
 from collections import defaultdict
@@ -13,7 +14,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database import (
@@ -81,13 +82,24 @@ async def cart_abandonment_reminder(bot, user_id, course_name):
 
 
 # ================= START / CHANNEL GATE =================
-async def _get_or_create_user(tg_user) -> tuple[User, bool]:
+async def _get_or_create_user(tg_user, referral_code: str | None = None) -> tuple[User, bool]:
     async with async_session() as session:
         result = await session.execute(select(User).where(User.id == tg_user.id))
         user = result.scalar_one_or_none()
         is_new = user is None
         if user is None:
-            user = User(id=tg_user.id, username=tg_user.username, first_name=tg_user.first_name)
+            referrer = None
+            if referral_code and referral_code.strip():
+                referrer = await session.scalar(
+                    select(User).where(User.referral_code == referral_code)
+                )
+            user = User(
+                id=tg_user.id,
+                username=tg_user.username,
+                first_name=tg_user.first_name,
+                referral_code=secrets.token_urlsafe(9),
+                referred_by=referrer.id if referrer and referrer.id != tg_user.id else None,
+            )
             session.add(user)
         else:
             user.username = tg_user.username
@@ -115,9 +127,14 @@ async def _notify_admin_of_start(bot, tg_user, is_new: bool, user: User):
         logger.exception("Failed to notify admin of /start")
 
 
-@router.message(CommandStart(deep_link=True))
+@router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
-    user, is_new = await _get_or_create_user(message.from_user)
+    referral_code = None
+    if command.args and command.args.startswith("ref_"):
+        candidate = command.args[4:]
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", candidate):
+            referral_code = candidate
+    user, is_new = await _get_or_create_user(message.from_user, referral_code)
     await _notify_admin_of_start(message.bot, message.from_user, is_new, user)
     await log_step(user.id, "Started the bot (/start)")
 
@@ -425,6 +442,46 @@ async def cmd_databases(message: Message):
 async def cb_databases(call: CallbackQuery):
     text, keyboard = await _database_catalog_content()
     await call.message.edit_text(text, reply_markup=keyboard)
+    await call.answer()
+
+
+async def _referral_content(bot, user_id: int) -> str:
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            return "Open the bot with /start first to create your invite link."
+        if not user.referral_code:
+            user.referral_code = secrets.token_urlsafe(9)
+            await session.commit()
+        referral_code = user.referral_code
+        count = await session.scalar(
+            select(func.count(User.id)).where(User.referred_by == user_id)
+        )
+    bot_profile = await bot.get_me()
+    if not bot_profile.username:
+        return "Invite links are temporarily unavailable. Please try again later."
+    invite_url = f"https://t.me/{bot_profile.username}?start=ref_{referral_code}"
+    return (
+        "🔗 <b>Invite Friends</b>\n\n"
+        f"Your link:\n<code>{escape(invite_url)}</code>\n\n"
+        f"Friends who join through your link: <b>{count or 0}</b>\n"
+        "Referral attribution is recorded once when a new user first opens the bot."
+    )
+
+
+@router.message(Command("referral"))
+async def cmd_referral(message: Message):
+    await message.answer(await _referral_content(message.bot, message.from_user.id))
+
+
+@router.callback_query(F.data == "referral:open")
+async def cb_referral(call: CallbackQuery):
+    await call.message.edit_text(
+        await _referral_content(call.bot, call.from_user.id),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅ Back", callback_data="menu:main")]]
+        ),
+    )
     await call.answer()
 
 

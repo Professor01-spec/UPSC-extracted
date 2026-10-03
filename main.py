@@ -19,7 +19,7 @@ from sqlalchemy import and_, delete, select, update as sql_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID, WEBHOOK_SECRET_TOKEN
-from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6, async_session, Section, Course, ConnectedChat, TelegramUpdate
+from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6, migrate_v7, async_session, Section, Course, ConnectedChat, TelegramUpdate
 from keyboards import get_line
 from webapp_template import render_section_page
 from security import (
@@ -107,6 +107,7 @@ USER_COMMANDS = [
     BotCommand(command="myid", description="Show my Telegram ID"),
     BotCommand(command="trending", description="Trending courses"),
     BotCommand(command="databases", description="Browse annual database access"),
+    BotCommand(command="referral", description="Invite friends and track joins"),
 ]
 
 ADMIN_COMMANDS = USER_COMMANDS + [
@@ -200,6 +201,7 @@ async def lifespan(app: FastAPI):
     await migrate_v4()
     await migrate_v5()
     await migrate_v6()
+    await migrate_v7()
     await seed_sections()
     await seed_courses()
     await migrate_v2()  # idempotent — restructures an existing DB to the v2 home-screen layout
