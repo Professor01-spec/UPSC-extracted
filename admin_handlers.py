@@ -1,6 +1,7 @@
 import csv
 import io
 import asyncio
+import logging
 from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, ChatMemberUpdated
@@ -11,10 +12,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage, ConnectedChat, AuditEvent
 from keyboards import AdminAddCourse, AdminBroadcast
-from config import ADMIN_ID
-from security import auto_delete_task
+from config import ADMIN_ID, GROUP_AUTO_DELETE_SECONDS
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 # ================= NEW: GLOBAL STATES FOR PREMIUM FEATURES =================
 AI_STATE = {"enabled": False}
@@ -59,6 +60,14 @@ async def on_bot_added_to_chat(event: ChatMemberUpdated):
             if not chat:
                 session.add(ConnectedChat(id=event.chat.id, type=event.chat.type))
                 await session.commit()
+            if event.chat.type in ("group", "supergroup") and GROUP_AUTO_DELETE_SECONDS:
+                try:
+                    await event.bot.set_chat_message_auto_delete_time(
+                        chat_id=event.chat.id,
+                        message_auto_delete_time=GROUP_AUTO_DELETE_SECONDS,
+                    )
+                except Exception:
+                    logger.info("Group auto-delete could not be enabled; check bot admin permissions")
                 
         # If bot is removed or kicked
         elif event.new_chat_member.status in ["left", "kicked", "restricted"]:
@@ -92,7 +101,7 @@ async def cmd_addforall(message: Message):
     if not message.reply_to_message:
         return await message.answer("❌ Please reply to the Ad message/photo with /addforall")
         
-    await message.answer("📢 Broadcasting to ALL connected Groups & Channels... (Auto-deletes in 72h)")
+    await message.answer("📢 Broadcasting to ALL connected Groups & Channels... (Auto-deletes in 24h)")
     
     async with async_session() as session:
         chats = (await session.execute(select(ConnectedChat))).scalars().all()
@@ -103,8 +112,7 @@ async def cmd_addforall(message: Message):
     sent, failed = 0, 0
     for chat in chats:
         try:
-            sent_msg = await message.reply_to_message.copy_to(chat_id=chat.id)
-            asyncio.create_task(auto_delete_task(message.bot, chat.id, sent_msg.message_id, delay_hours=72))
+            await message.reply_to_message.copy_to(chat_id=chat.id)
             sent += 1
         except Exception:
             failed += 1

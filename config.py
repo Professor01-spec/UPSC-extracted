@@ -1,10 +1,4 @@
-"""
-All secrets/settings load from environment variables (Railway Variables tab,
-or from app.env locally). BOT_TOKEN and other values are already in app.env —
-just fill DATABASE_URL after Postgres exists on Railway; WEBAPP_BASE_URL is
-now auto-detected from Railway's public domain, so you shouldn't need to set
-it by hand (see below).
-"""
+"""Load required credentials and optional runtime settings from the environment."""
 import os
 from dotenv import load_dotenv
 
@@ -33,5 +27,8 @@ if not _raw_webapp_url:
 WEBAPP_BASE_URL = _raw_webapp_url
 PORT = int(os.environ.get("PORT", "8080"))
 WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "").strip()
+GROUP_AUTO_DELETE_SECONDS = int(os.environ.get("GROUP_AUTO_DELETE_SECONDS", "86400"))
+if not 0 <= GROUP_AUTO_DELETE_SECONDS <= 604800:
+    raise ValueError("GROUP_AUTO_DELETE_SECONDS must be between 0 and 604800")
 
 BOT_NAME = "UPSC Course Zone by Professor"

@@ -13,12 +13,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Update, Message, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import and_, delete, select, update as sql_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID, WEBHOOK_SECRET_TOKEN
+from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID, WEBHOOK_SECRET_TOKEN, GROUP_AUTO_DELETE_SECONDS
 from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, migrate_v5, async_session, Section, Course, ConnectedChat, TelegramUpdate
 from keyboards import get_line
 from webapp_template import render_section_page
@@ -26,7 +26,7 @@ from security import (
     SecurityMiddleware, BackupGateCallbackMiddleware,
     register_dispatcher_auto_heal, state_backup_loop, restore_state_backup,
     _save_state_snapshot, daily_data_backup_task, morning_motivation_task,
-    night_motivation_task,
+    night_motivation_task, auto_delete_task, auto_delete_worker,
 )
 from admin_handlers import AI_STATE
 import user_handlers
@@ -38,7 +38,25 @@ WEBHOOK_BODY_LIMIT = 1024 * 1024
 WEBHOOK_SECRET_VALID = bool(re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET_TOKEN))
 
 # aiogram 3.7+ requires parse_mode via DefaultBotProperties, not a direct kwarg.
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+class AutoDeletingBot(Bot):
+    async def __call__(self, method, request_timeout=None):
+        result = await super().__call__(method, request_timeout=request_timeout)
+        messages = result if isinstance(result, list) else [result]
+        for sent_message in messages:
+            if isinstance(sent_message, Message):
+                chat_id, message_id = sent_message.chat.id, sent_message.message_id
+            else:
+                message_id = getattr(sent_message, "message_id", None)
+                chat_id = getattr(method, "chat_id", None)
+            if chat_id is not None and message_id is not None:
+                try:
+                    await auto_delete_task(self, chat_id, message_id, delay_hours=24)
+                except Exception:
+                    logger.exception("Failed to schedule bot message deletion")
+        return result
+
+
+bot = AutoDeletingBot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
 # 🛡️ ZERO-TRUST SECURITY FIREWALL ACTIVATION
@@ -158,6 +176,24 @@ async def daily_promotional_task(bot_instance: Bot):
             logger.error(f"Daily task loop error: {e}")
 
 
+async def enable_connected_group_auto_delete():
+    if not GROUP_AUTO_DELETE_SECONDS:
+        return
+    async with async_session() as session:
+        result = await session.execute(
+            select(ConnectedChat).where(ConnectedChat.type.in_(("group", "supergroup")))
+        )
+        chats = result.scalars().all()
+    for chat in chats:
+        try:
+            await bot.set_chat_message_auto_delete_time(
+                chat_id=chat.id,
+                message_auto_delete_time=GROUP_AUTO_DELETE_SECONDS,
+            )
+        except Exception:
+            logger.info("Group auto-delete could not be enabled for a connected chat")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -187,6 +223,8 @@ async def lifespan(app: FastAPI):
         await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     except TelegramBadRequest:
         logger.exception("Failed to set bot commands")
+
+    await enable_connected_group_auto_delete()
 
     if WEBAPP_BASE_URL and WEBHOOK_SECRET_VALID:
         webhook_url = f"{WEBAPP_BASE_URL}/webhook"
@@ -222,6 +260,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(daily_data_backup_task(bot))
     asyncio.create_task(morning_motivation_task(bot))
     asyncio.create_task(night_motivation_task(bot))
+    asyncio.create_task(auto_delete_worker(bot))
 
     yield
 

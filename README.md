@@ -21,6 +21,8 @@ Bot service → **Variables** tab. Set these values there; do not commit them:
 
 `PORT` and `RAILWAY_PUBLIC_DOMAIN` are provided by Railway. Without a valid `WEBHOOK_SECRET_TOKEN`, the service disables the Telegram webhook.
 
+Bot-sent messages in private and group chats are queued for deletion after 24 hours. Connected groups and supergroups also use Telegram's native 24-hour auto-delete timer, which applies to every member's new messages when the bot has permission. Set `GROUP_AUTO_DELETE_SECONDS=0` to disable the group-wide timer; private-chat cleanup remains bot-message-only.
+
 ### 4. Redeploy
 Variables save karne ke baad Railway khud redeploy karega. **Deployments** tab me "Success" dikhna chahiye.
 

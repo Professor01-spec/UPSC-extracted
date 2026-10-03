@@ -144,6 +144,17 @@ class PaymentProof(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class ScheduledDeletion(Base):
+    __tablename__ = "scheduled_deletions"
+    __table_args__ = (UniqueConstraint("chat_id", "message_id", name="uq_scheduled_deletions_chat_message"),)
+
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger, nullable=False)
+    message_id = Column(Integer, nullable=False)
+    delete_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+
+
 # ---------------- engine / session ----------------
 engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 async_session = async_sessionmaker(engine, expire_on_commit=False)

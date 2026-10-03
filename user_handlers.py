@@ -1024,10 +1024,29 @@ async def _run_professor_ai(message: Message, user_id: int, user_text: str):
         async with async_session() as session:
             result = await session.execute(select(Course).where(Course.is_active == True))
             courses = result.scalars().all()
+            owned_result = await session.execute(
+                select(Course.name)
+                .join(UserCourse, UserCourse.course_id == Course.id)
+                .where(UserCourse.user_id == user_id)
+            )
+            pending_result = await session.execute(
+                select(Course.name)
+                .join(Order, Order.course_id == Course.id)
+                .where(Order.user_id == user_id, Order.status == "pending")
+            )
         all_courses = [(c.name, c.faculty, c.medium, c.price, [s.key for s in c.sections]) for c in courses]
+        owned_courses = [name for (name,) in owned_result.all()]
+        pending_courses = [name for (name,) in pending_result.all()]
+        user_context = (
+            f"Courses this student currently owns: {', '.join(owned_courses[:20]) or 'none'}. "
+            f"Courses with an order awaiting review: {', '.join(pending_courses[:20]) or 'none'}."
+        )
 
         ai_reply = await professor_ai_reply(
-            user_text, all_courses, user_context=f"telegram_user_id={user_id}"
+            user_text,
+            all_courses,
+            user_context=user_context,
+            user_id=user_id,
         )
         if not ai_reply:
             # professor_ai_reply is wrapped by @ai_security_guard in security.py,
