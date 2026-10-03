@@ -3,12 +3,19 @@
   "functions": {
     "api/index.py": {
       "maxDuration": 60
+    },
+    "api/[...path].py": {
+      "maxDuration": 60
     }
   },
   "rewrites": [
     {
-      "source": "/(.*)",
+      "source": "/",
       "destination": "/api/index"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/api/$1"
     }
   ]
 }

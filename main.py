@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -288,6 +289,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def normalize_vercel_path(request: Request, call_next):
+    if os.environ.get("VERCEL") == "1":
+        path = request.scope.get("path", "")
+        if path == "/api/index":
+            path = "/"
+        elif path.startswith("/api/"):
+            path = path[4:]
+        if path != request.scope.get("path"):
+            request.scope["path"] = path
+            request.scope["raw_path"] = path.encode("utf-8")
+    return await call_next(request)
 
 
 async def authenticated_mini_app_user(request: Request):
