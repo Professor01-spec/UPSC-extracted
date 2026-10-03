@@ -21,9 +21,10 @@ from aiogram import BaseMiddleware, Dispatcher
 from aiogram.types import Message, ErrorEvent, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from PIL import Image
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import ADMIN_ID, BACKUP_CHANNEL
-from database import async_session, User, Order, Course, ConnectedChat
+from database import async_session, User, Order, Course, ConnectedChat, PaymentProof
 
 logger = logging.getLogger(__name__)
 
@@ -639,13 +640,25 @@ def _too_many_attempts(user_id: int) -> bool:
 def _record_attempt(user_id: int):
     payment_attempts[user_id].append(time.time())
 
-def _duplicate_check(image_bytes: bytes, user_id: int):
+async def _duplicate_check(image_bytes: bytes, user_id: int):
     file_hash = hashlib.sha256(image_bytes).hexdigest()
-    existing = payment_hash_registry.get(file_hash)
-    is_replay = bool(existing)
-    prior_user = existing["user_id"] if existing else None
+    async with async_session() as session:
+        inserted = await session.execute(
+            pg_insert(PaymentProof)
+            .values(proof_hash=file_hash, user_id=user_id)
+            .on_conflict_do_nothing(index_elements=["proof_hash"])
+            .returning(PaymentProof.proof_hash)
+        )
+        is_new = inserted.scalar_one_or_none() is not None
+        if is_new:
+            await session.commit()
+            prior_user = None
+        else:
+            prior_user = await session.scalar(
+                select(PaymentProof.user_id).where(PaymentProof.proof_hash == file_hash)
+            )
     payment_hash_registry[file_hash] = {"user_id": user_id, "ts": time.time(), "status": "seen"}
-    return is_replay, prior_user, file_hash
+    return not is_new, prior_user, file_hash
 
 
 @ai_security_guard
@@ -668,7 +681,7 @@ async def inspect_payment_proof(bot, photo_file_id, user_id: int, expected_amoun
     file_bytes = await bot.download_file(file_info.file_path)
     image_bytes = file_bytes.read()
 
-    is_replay, prior_user, file_hash = _duplicate_check(image_bytes, user_id)
+    is_replay, prior_user, file_hash = await _duplicate_check(image_bytes, user_id)
     if is_replay:
         await _notify_admin_safe(
             bot,

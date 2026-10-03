@@ -4,19 +4,22 @@ import hmac
 import json
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Literal
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import select
+from sqlalchemy import and_, delete, select, update as sql_update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID, WEBHOOK_SECRET_TOKEN
-from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, async_session, Section, Course, ConnectedChat
+from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, migrate_v5, async_session, Section, Course, ConnectedChat, TelegramUpdate
 from keyboards import get_line
 from webapp_template import render_section_page
 from security import (
@@ -159,6 +162,7 @@ async def daily_promotional_task(bot_instance: Bot):
 async def lifespan(app: FastAPI):
     await init_db()
     await migrate_v4()
+    await migrate_v5()
     await seed_sections()
     await seed_courses()
     await migrate_v2()  # idempotent — restructures an existing DB to the v2 home-screen layout
@@ -243,9 +247,11 @@ async def telegram_webhook(request: Request):
                 return JSONResponse({"detail": "Request too large"}, status_code=413)
         except ValueError:
             return JSONResponse({"detail": "Invalid request"}, status_code=400)
-    body = await request.body()
-    if len(body) > WEBHOOK_BODY_LIMIT:
-        return JSONResponse({"detail": "Request too large"}, status_code=413)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > WEBHOOK_BODY_LIMIT:
+            return JSONResponse({"detail": "Request too large"}, status_code=413)
     try:
         data = json.loads(body)
         if not isinstance(data, dict):
@@ -253,7 +259,55 @@ async def telegram_webhook(request: Request):
         update = Update(**data)
     except (ValueError, TypeError):
         return JSONResponse({"detail": "Invalid request"}, status_code=400)
-    await dp.feed_update(bot, update)
+
+    now = datetime.utcnow()
+    stale_before = now - timedelta(minutes=10)
+    async with async_session() as session:
+        claim = await session.execute(
+            pg_insert(TelegramUpdate)
+            .values(
+                update_id=update.update_id,
+                status="processing",
+                created_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=[TelegramUpdate.update_id],
+                set_={"status": "processing", "created_at": now, "completed_at": None},
+                where=and_(
+                    TelegramUpdate.status != "processed",
+                    TelegramUpdate.created_at < stale_before,
+                ),
+            )
+            .returning(TelegramUpdate.update_id)
+        )
+        claimed_id = claim.scalar_one_or_none()
+        await session.commit()
+
+    if claimed_id is None:
+        async with async_session() as session:
+            existing = await session.get(TelegramUpdate, update.update_id)
+            if existing and existing.status == "processed":
+                return {"ok": True, "duplicate": True}
+        return JSONResponse({"detail": "Update is being processed"}, status_code=503)
+
+    try:
+        await dp.feed_update(bot, update)
+    except Exception:
+        logger.exception("Telegram update processing failed")
+        async with async_session() as session:
+            await session.execute(
+                delete(TelegramUpdate).where(TelegramUpdate.update_id == update.update_id)
+            )
+            await session.commit()
+        return JSONResponse({"detail": "Update processing failed"}, status_code=503)
+
+    async with async_session() as session:
+        await session.execute(
+            sql_update(TelegramUpdate)
+            .where(TelegramUpdate.update_id == update.update_id)
+            .values(status="processed", completed_at=datetime.utcnow())
+        )
+        await session.commit()
     return {"ok": True}
 
 
@@ -274,7 +328,15 @@ async def webapp_section(section_key: str):
 
 
 @app.get("/api/courses")
-async def api_courses(section_key: str):
+async def api_courses(
+    section_key: str,
+    search: str | None = Query(default=None, max_length=100),
+    faculty: str | None = Query(default=None, max_length=100),
+    medium: str | None = Query(default=None, max_length=50),
+    sort_by: Literal["name", "faculty", "price", "trending"] | None = None,
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=100000),
+):
     async with async_session() as session:
         if section_key == "all":
             result = await session.execute(select(Course).where(Course.is_active == True))  # noqa: E712
@@ -309,6 +371,33 @@ async def api_courses(section_key: str):
                         if c.is_active:
                             seen[c.id] = c
             courses = list(seen.values())
+
+        if search:
+            query = search.casefold().strip()
+            courses = [
+                course for course in courses
+                if query in f"{course.name} {course.faculty} {course.medium} {course.notes}".casefold()
+            ]
+        if faculty:
+            faculty_filter = faculty.casefold().strip()
+            courses = [course for course in courses if faculty_filter in (course.faculty or "").casefold()]
+        if medium:
+            medium_filter = medium.casefold().strip()
+            courses = [course for course in courses if medium_filter in (course.medium or "").casefold()]
+
+        if sort_by == "faculty":
+            courses.sort(key=lambda course: ((course.faculty or "").casefold(), course.name.casefold(), course.id))
+        elif sort_by == "price":
+            courses.sort(key=lambda course: (course.price is None, course.price or 0, course.id))
+        elif sort_by == "trending":
+            courses.sort(key=lambda course: (not course.is_trending, course.name.casefold(), course.id))
+        elif sort_by == "name":
+            courses.sort(key=lambda course: (course.name.casefold(), course.id))
+
+        if limit is not None:
+            courses = courses[offset:offset + limit]
+        elif offset:
+            courses = courses[offset:]
 
         payload = [
             {

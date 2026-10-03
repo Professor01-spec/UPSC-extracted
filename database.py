@@ -5,7 +5,7 @@ catalog seed, all in one file.
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Text, Boolean, ForeignKey,
-    DateTime, Table, Numeric, select
+    DateTime, Table, Numeric, UniqueConstraint, select
 )
 from sqlalchemy.orm import relationship, declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -81,6 +81,7 @@ class Order(Base):
 
 class UserCourse(Base):
     __tablename__ = "user_courses"
+    __table_args__ = (UniqueConstraint("user_id", "course_id", name="uq_user_courses_user_course"),)
 
     id = Column(Integer, primary_key=True)
     user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
@@ -123,6 +124,23 @@ class AuditEvent(Base):
     action = Column(String(100), nullable=False)
     target_type = Column(String(50), nullable=False)
     target_id = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class TelegramUpdate(Base):
+    __tablename__ = "telegram_updates"
+
+    update_id = Column(BigInteger, primary_key=True)
+    status = Column(String(20), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class PaymentProof(Base):
+    __tablename__ = "payment_proofs"
+
+    proof_hash = Column(String(64), primary_key=True)
+    user_id = Column(BigInteger, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
@@ -464,4 +482,23 @@ async def migrate_v4():
     async with engine.begin() as conn:
         await conn.exec_driver_sql(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS backup_channel_checked_at TIMESTAMP NULL"
+        )
+
+
+async def migrate_v5():
+    async with engine.begin() as conn:
+        constraint = await conn.exec_driver_sql(
+            "SELECT 1 FROM pg_constraint "
+            "WHERE conname = 'uq_user_courses_user_course' "
+            "AND conrelid = 'user_courses'::regclass"
+        )
+        if constraint.scalar_one_or_none() is not None:
+            return
+
+        await conn.exec_driver_sql(
+            "DELETE FROM user_courses older USING user_courses newer "
+            "WHERE older.user_id = newer.user_id AND older.course_id = newer.course_id AND older.id > newer.id"
+        )
+        await conn.exec_driver_sql(
+            "ALTER TABLE user_courses ADD CONSTRAINT uq_user_courses_user_course UNIQUE (user_id, course_id)"
         )

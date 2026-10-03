@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import asyncio
 import re
@@ -12,9 +13,10 @@ from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database import (
-    async_session, User, Course, Order, UserCourse, Section, ContactMessage, log_step,
+    async_session, User, Course, Order, UserCourse, Section, ContactMessage, PaymentProof, log_step,
 )
 from config import BACKUP_CHANNEL, BOT_NAME, ADMIN_ID, PROFESSOR_CONTACT_LINK
 from keyboards import (
@@ -365,11 +367,28 @@ async def _notify_admin_buy_intent(bot, tg_user, course: Course):
         logger.exception("Failed to notify admin of buy intent")
 
 
-async def _show_buy_screen(message: Message, course_id: int, tg_user=None, edit: bool = False):
-    tg_user = tg_user or message.from_user
+def _callback_course_id(data: str, expected_prefix: str) -> int | None:
+    parts = data.split(":")
+    expected_parts = expected_prefix.count(":") + 2
+    if len(parts) != expected_parts or ":".join(parts[:-1]) != expected_prefix:
+        return None
+    try:
+        course_id = int(parts[-1])
+    except (AttributeError, IndexError, ValueError):
+        return None
+    return course_id if 0 < course_id <= 2_147_483_647 else None
+
+
+async def _get_available_course(course_id: int) -> Course | None:
     async with async_session() as session:
         course = await session.get(Course, course_id)
-    if not course or not course.is_active:
+    return course if course and course.is_active else None
+
+
+async def _show_buy_screen(message: Message, course_id: int, tg_user=None, edit: bool = False):
+    tg_user = tg_user or message.from_user
+    course = await _get_available_course(course_id)
+    if not course:
         target = message.edit_text if edit else message.answer
         await target("This course isn't available right now — please pick another from the menu.", reply_markup=main_menu_kb())
         return
@@ -384,14 +403,21 @@ async def _show_buy_screen(message: Message, course_id: int, tg_user=None, edit:
 
 @router.callback_query(F.data.startswith("buy:"))
 async def cb_buy(call: CallbackQuery):
-    course_id = int(call.data.split(":", 1)[1])
+    course_id = _callback_course_id(call.data, "buy")
+    if course_id is None:
+        await call.answer("This course isn't available right now.", show_alert=True)
+        return
     await _show_buy_screen(call.message, course_id, tg_user=call.from_user, edit=True)
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("paym:upi:"))
 async def cb_pay_upi(call: CallbackQuery):
-    course_id = int(call.data.split(":", 2)[2])
+    course_id = _callback_course_id(call.data, "paym:upi")
+    course = await _get_available_course(course_id) if course_id else None
+    if not course:
+        await call.answer("This course isn't available right now.", show_alert=True)
+        return
     await log_step(call.from_user.id, f"Chose UPI payment for course_id={course_id}")
     await call.message.edit_text(
         "💳 <b>UPI Payment</b>\n\n"
@@ -405,9 +431,8 @@ async def cb_pay_upi(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("paym:amazon:"))
 async def cb_pay_amazon(call: CallbackQuery):
-    course_id = int(call.data.split(":", 2)[2])
-    async with async_session() as session:
-        course = await session.get(Course, course_id)
+    course_id = _callback_course_id(call.data, "paym:amazon")
+    course = await _get_available_course(course_id) if course_id else None
     if not course:
         await call.answer("This course isn't available right now.", show_alert=True)
         return
@@ -424,9 +449,8 @@ async def cb_pay_amazon(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("sendgc:"))
 async def cb_send_gift_card(call: CallbackQuery, state: FSMContext):
-    course_id = int(call.data.split(":", 1)[1])
-    async with async_session() as session:
-        course = await session.get(Course, course_id)
+    course_id = _callback_course_id(call.data, "sendgc")
+    course = await _get_available_course(course_id) if course_id else None
     if not course:
         await call.answer("This course isn't available right now.", show_alert=True)
         return
@@ -601,6 +625,30 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
                 parse_mode="HTML"
             )
             return
+
+    if kind != "photo":
+        fingerprint_payload = (
+            re.sub(r"[^A-Za-z0-9]", "", content).upper()
+            if kind == "text"
+            else content
+        )
+        proof_hash = hashlib.sha256(
+            f"{kind}:{fingerprint_payload}".encode("utf-8")
+        ).hexdigest()
+        async with async_session() as session:
+            inserted = await session.execute(
+                pg_insert(PaymentProof)
+                .values(proof_hash=proof_hash, user_id=message.from_user.id)
+                .on_conflict_do_nothing(index_elements=["proof_hash"])
+                .returning(PaymentProof.proof_hash)
+            )
+            if inserted.scalar_one_or_none() is None:
+                await message.answer(
+                    "❌ This payment proof has already been submitted. Please send a different proof.",
+                    parse_mode="HTML",
+                )
+                return
+            await session.commit()
                         
     async with async_session() as session:
         course = await session.get(Course, course_id)

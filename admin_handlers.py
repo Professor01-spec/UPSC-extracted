@@ -7,6 +7,7 @@ from aiogram.types import Message, CallbackQuery, BufferedInputFile, ChatMemberU
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select, func, desc
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage, ConnectedChat, AuditEvent
 from keyboards import AdminAddCourse, AdminBroadcast
@@ -306,7 +307,17 @@ async def cmd_grant(message: Message):
         if existing.scalar_one_or_none():
             await message.answer("ℹ️ This user already owns this course.")
             return
-        session.add(UserCourse(user_id=user_id, course_id=course_id))
+        await session.execute(
+            pg_insert(UserCourse)
+            .values(user_id=user_id, course_id=course_id)
+            .on_conflict_do_nothing(index_elements=["user_id", "course_id"])
+        )
+        session.add(AuditEvent(
+            actor_id=message.from_user.id,
+            action="course.access.granted",
+            target_type="course",
+            target_id=str(course_id),
+        ))
         await session.commit()
 
     try:
@@ -832,7 +843,11 @@ async def cb_approve(call: CallbackQuery):
             return
         order.status = "approved"
         order.decided_at = datetime.utcnow()
-        session.add(UserCourse(user_id=order.user_id, course_id=order.course_id))
+        await session.execute(
+            pg_insert(UserCourse)
+            .values(user_id=order.user_id, course_id=order.course_id)
+            .on_conflict_do_nothing(index_elements=["user_id", "course_id"])
+        )
         session.add(AuditEvent(
             actor_id=call.from_user.id,
             action="payment.approved",
