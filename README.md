@@ -54,6 +54,8 @@ An Admin can add a Notion product with `/adddatabase Name | https://www.notion.s
 
 CA and Notion use the same annual entitlement. The portal stores four independent datasets: `daily_ca`, `editorial`, `place_in_news`, and `international_orgs`. Users can browse with `/ca dataset | YYYY-MM-DD | topic | subtopic | keyword`, bookmark/read/revise records, and save private notes with `/canote`.
 
+Every verified user can open 10 distinct CA records as a free demo; revisiting the same demo record does not spend another entry. The Telegram Mini App shows the signed-in profile and remaining demo balance. `/api/me` and `/api/courses` verify signed, fresh Telegram `initData` and the backup-channel membership server-side; browser-supplied user IDs are not used for identity.
+
 For bidirectional sync, set `NOTION_API_KEY` and `NOTION_DATABASE_ID` in the server environment, invite the integration to the Notion database with read/insert/update permissions, then restart the bot. Admin commands are `/caadd`, `/notionsync [dataset=daily_ca] [from=YYYY-MM-DD] [to=YYYY-MM-DD]`, `/notionstatus`, and `/notionresolve <record_id> portal|notion`. Pushes are queued and retried; pulls report success only after Notion returns a successful API response. Conflicts stay visible until an Admin selects a side.
 
 Notion page zoom is controlled by the Notion client/browser accessibility settings; the Notion API cannot change an individual user's zoom level. The Telegram CA record view provides the same source/content data in a compact message view.

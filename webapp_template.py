@@ -37,6 +37,13 @@ SECTION_HTML = """<!DOCTYPE html>
   .urgency { display: inline-block; margin-top: 6px; font-size: 11px; font-weight: 700; color: #D64545; background: #FDE4E4; padding: 3px 9px; border-radius: 999px; }
   .empty { text-align: center; color: var(--hint); padding: 40px 10px; font-size: 14px; }
   .trust-badge { text-align: center; font-size: 11.5px; color: var(--success); margin-top: 18px; padding-bottom: 10px; }
+  .profile { display: flex; align-items: center; gap: 11px; margin: 10px 0 16px; padding: 11px 12px; border-radius: 12px; background: var(--card-bg); border: 1px solid rgba(232,93,156,0.12); }
+  .profile-avatar { width: 38px; height: 38px; flex: 0 0 38px; display: grid; place-items: center; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+  .profile-info { min-width: 0; flex: 1; }
+  .profile-name { font-size: 14px; font-weight: 650; }
+  .profile-meta { margin-top: 3px; color: var(--hint); font-size: 11px; }
+  .profile-counts { color: var(--text); font-size: 11px; text-align: right; white-space: nowrap; }
+  .error { margin: 12px 0; padding: 12px; border-radius: 10px; color: var(--text); background: var(--card-bg); border: 1px solid #D64545; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -45,6 +52,16 @@ SECTION_HTML = """<!DOCTYPE html>
   <h1>📚 __SECTION_TITLE__</h1>
   <p>__TAGLINE__</p>
 </header>
+
+<section class="profile" id="profilePanel" style="display:none" aria-label="Telegram profile">
+  <div class="profile-avatar" id="profileAvatar">•</div>
+  <div class="profile-info">
+    <div class="profile-name" id="profileName"></div>
+    <div class="profile-meta" id="profileMeta"></div>
+  </div>
+  <div class="profile-counts" id="profileCounts"></div>
+</section>
+<div class="error" id="appError" style="display:none" role="alert"></div>
 
 <div class="search-bar">
   <input id="searchInput" type="text" placeholder="🔍 Search course or faculty...">
@@ -69,11 +86,51 @@ SECTION_HTML = """<!DOCTYPE html>
   const SECTION_KEY = "__SECTION_KEY__";
   let allCourses = [];
   let activeMedium = "all";
+  const apiHeaders = {"X-Telegram-Init-Data": tg.initData || ""};
+
+  function showError(text) {
+    const panel = document.getElementById("appError");
+    panel.textContent = text;
+    panel.style.display = "block";
+  }
+
+  async function loadProfile() {
+    if (!tg.initData) {
+      showError("Open this catalog from the official Telegram bot to verify your account.");
+      return false;
+    }
+    const response = await fetch("/api/me", {headers: apiHeaders});
+    if (response.status === 403) {
+      showError("Join the required backup channel, then reopen the Mini App from the bot.");
+      return false;
+    }
+    if (!response.ok) {
+      showError("We couldn't verify your Telegram profile. Reopen the Mini App and try again.");
+      return false;
+    }
+    const profile = await response.json();
+    const name = profile.first_name || "Student";
+    document.getElementById("profileAvatar").textContent = name.trim().slice(0, 1).toUpperCase();
+    document.getElementById("profileName").textContent = name;
+    document.getElementById("profileMeta").textContent = profile.username ? `@${profile.username}` : "Verified Telegram account";
+    const accessLabel = profile.active_database_access
+      ? "CA + Notion active"
+      : `${profile.ca_demo_entries_remaining}/10 free CA entries`;
+    document.getElementById("profileCounts").textContent = `${profile.active_courses} courses · ${profile.pending_orders} pending · ${accessLabel}`;
+    document.getElementById("profilePanel").style.display = "flex";
+    return true;
+  }
 
   async function loadCourses() {
-    const res = await fetch(`/api/courses?section_key=${SECTION_KEY}`);
-    allCourses = await res.json();
-    render();
+    try {
+      if (!await loadProfile()) return;
+      const res = await fetch(`/api/courses?section_key=${encodeURIComponent(SECTION_KEY)}`, {headers: apiHeaders});
+      if (!res.ok) throw new Error("catalog_unavailable");
+      allCourses = await res.json();
+      render();
+    } catch (_error) {
+      showError("The catalog is temporarily unavailable. Please retry shortly.");
+    }
   }
 
   function render() {

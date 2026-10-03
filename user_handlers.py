@@ -525,20 +525,36 @@ async def _ca_filters_content(user_id: int, filters_text: str):
 
 
 async def _ca_entry_view(user_id: int, record_id: int):
-    if not await _has_ca_entitlement(user_id):
-        return None
+    has_entitlement = await _has_ca_entitlement(user_id)
     async with async_session() as session:
+        user_exists = await session.scalar(select(User.id).where(User.id == user_id).with_for_update())
+        if not user_exists:
+            return None
         record = await session.get(CurrentAffair, record_id)
         if not record or not record.is_active:
             return None
-        await session.execute(
-            pg_insert(CAUserState)
-            .values(user_id=user_id, affair_id=record_id, last_viewed_at=datetime.utcnow())
-            .on_conflict_do_nothing(index_elements=["user_id", "affair_id"])
-        )
         state = await session.scalar(
-            select(CAUserState).where(CAUserState.user_id == user_id, CAUserState.affair_id == record_id)
+            select(CAUserState)
+            .where(CAUserState.user_id == user_id, CAUserState.affair_id == record_id)
+            .with_for_update()
         )
+        if not has_entitlement and not (state and state.is_demo_view):
+            demo_count = await session.scalar(
+                select(func.count(CAUserState.id)).where(
+                    CAUserState.user_id == user_id,
+                    CAUserState.is_demo_view == True,
+                )
+            ) or 0
+            if demo_count >= 10:
+                return None
+            if state:
+                state.is_demo_view = True
+            else:
+                state = CAUserState(user_id=user_id, affair_id=record_id, is_demo_view=True)
+                session.add(state)
+        elif not state:
+            state = CAUserState(user_id=user_id, affair_id=record_id)
+            session.add(state)
         state.last_viewed_at = datetime.utcnow()
         await session.commit()
     safe_source = _safe_ca_url(record.source_url)
@@ -581,20 +597,20 @@ async def _ca_entry_view(user_id: int, record_id: int):
 
 @router.message(Command("ca"))
 async def cmd_current_affairs(message: Message):
-    if not await _has_ca_entitlement(message.from_user.id):
-        await message.answer("Current Affairs + Notion access requires an active annual Database Access entitlement. Use /databases to review offers.")
-        return
+    has_entitlement = await _has_ca_entitlement(message.from_user.id)
     filters_text = message.text.split(maxsplit=1)[1] if len(message.text.split(maxsplit=1)) == 2 else ""
     text, keyboard = await _ca_filters_content(message.from_user.id, filters_text)
+    if not has_entitlement:
+        text = "🎁 Free demo: open up to 10 distinct CA entries.\n\n" + text
     await message.answer(text, reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "ca:open")
 async def cb_ca_open(call: CallbackQuery):
-    if not await _has_ca_entitlement(call.from_user.id):
-        await call.answer("Active CA + Notion access is required.", show_alert=True)
-        return
+    has_entitlement = await _has_ca_entitlement(call.from_user.id)
     text, keyboard = await _ca_filters_content(call.from_user.id, "")
+    if not has_entitlement:
+        text = "🎁 Free demo: open up to 10 distinct CA entries.\n\n" + text
     await call.message.edit_text(text, reply_markup=keyboard)
     await call.answer()
 
@@ -604,7 +620,13 @@ async def cb_ca_view(call: CallbackQuery):
     record_id = _ca_record_id(call.data, "view")
     detail = await _ca_entry_view(call.from_user.id, record_id) if record_id else None
     if not detail:
-        await call.answer("Record unavailable or active access required.", show_alert=True)
+        if await _has_ca_entitlement(call.from_user.id):
+            await call.answer("Record unavailable.", show_alert=True)
+        else:
+            await call.answer(
+                "10-record demo limit reached. Get CA + Notion annual access from Database Access.",
+                show_alert=True,
+            )
         return
     await call.message.edit_text(detail[0], reply_markup=detail[1], disable_web_page_preview=True)
     await call.answer()

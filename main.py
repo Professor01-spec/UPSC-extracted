@@ -1,11 +1,14 @@
 import logging
 import asyncio
+import hashlib
 import hmac
 import json
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Literal
+from types import SimpleNamespace
+from urllib.parse import parse_qsl
 
 import uvicorn
 from fastapi import FastAPI, Query, Request
@@ -15,18 +18,18 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update, Message, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import and_, delete, select, update as sql_update
+from sqlalchemy import and_, delete, func, or_, select, update as sql_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID, WEBHOOK_SECRET_TOKEN
-from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6, migrate_v7, async_session, Section, Course, ConnectedChat, TelegramUpdate
+from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6, migrate_v7, migrate_v8, async_session, Section, Course, ConnectedChat, TelegramUpdate, User, UserCourse, Order, CAUserState
 from keyboards import get_line
 from webapp_template import render_section_page
 from security import (
     SecurityMiddleware, BackupGateCallbackMiddleware,
     register_dispatcher_auto_heal, state_backup_loop, restore_state_backup,
     _save_state_snapshot, daily_data_backup_task, morning_motivation_task,
-    night_motivation_task, auto_delete_task, auto_delete_worker,
+    night_motivation_task, auto_delete_task, auto_delete_worker, verify_backup_channel_membership,
 )
 from notion_sync import notion_sync_worker
 from admin_handlers import AI_STATE
@@ -212,6 +215,7 @@ async def lifespan(app: FastAPI):
     await migrate_v5()
     await migrate_v6()
     await migrate_v7()
+    await migrate_v8()
     await seed_sections()
     await seed_courses()
     await migrate_v2()  # idempotent — restructures an existing DB to the v2 home-screen layout
@@ -284,6 +288,96 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+async def authenticated_mini_app_user(request: Request):
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    if not init_data or len(init_data) > 4096:
+        return None, "unauthorized"
+    try:
+        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+        if len({key for key, _ in pairs}) != len(pairs):
+            return None, "unauthorized"
+        fields = dict(pairs)
+        supplied_hash = fields.pop("hash", "")
+        auth_date = int(fields.get("auth_date", "0"))
+        now = int(datetime.utcnow().timestamp())
+        if not supplied_hash or auth_date > now + 60 or now - auth_date > 86400:
+            return None, "unauthorized"
+        data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(supplied_hash, expected_hash):
+            return None, "unauthorized"
+        telegram_user = json.loads(fields["user"])
+        user_id = int(telegram_user["id"])
+        if user_id <= 0:
+            return None, "unauthorized"
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None, "unauthorized"
+
+    user_for_membership = SimpleNamespace(
+        username=telegram_user.get("username"),
+        first_name=telegram_user.get("first_name", ""),
+    )
+    if not await verify_backup_channel_membership(bot, user_id, user_for_membership):
+        return None, "membership_required"
+    return telegram_user, None
+
+
+@app.get("/api/me")
+async def api_current_user(request: Request):
+    telegram_user, auth_error = await authenticated_mini_app_user(request)
+    if auth_error == "membership_required":
+        return JSONResponse({"detail": "Join the backup channel before using the Mini App."}, status_code=403)
+    if not telegram_user:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    user_id = int(telegram_user["id"])
+    now = datetime.utcnow()
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            return JSONResponse({"detail": "User profile unavailable"}, status_code=404)
+        courses = await session.scalar(
+            select(func.count(UserCourse.id))
+            .where(
+                UserCourse.user_id == user_id,
+                or_(UserCourse.expires_at.is_(None), UserCourse.expires_at > now),
+            )
+        )
+        pending_orders = await session.scalar(
+            select(func.count(Order.id)).where(Order.user_id == user_id, Order.status == "pending")
+        )
+        database_access = await session.scalar(
+            select(func.count(UserCourse.id))
+            .join(Course, Course.id == UserCourse.course_id)
+            .where(
+                UserCourse.user_id == user_id,
+                Course.is_ca_notion_access == True,
+                Course.is_active == True,
+                or_(UserCourse.expires_at.is_(None), UserCourse.expires_at > now),
+            )
+        )
+        referrals = await session.scalar(select(func.count(User.id)).where(User.referred_by == user_id))
+        demo_views = await session.scalar(
+            select(func.count(CAUserState.id)).where(
+                CAUserState.user_id == user_id,
+                CAUserState.is_demo_view == True,
+            )
+        ) or 0
+        profile = {
+            "first_name": user.first_name or "Student",
+            "username": user.username,
+            "is_verified": bool(user.has_joined_backup_channel),
+            "joined_at": user.joined_at.isoformat() if user.joined_at else None,
+            "active_courses": courses or 0,
+            "pending_orders": pending_orders or 0,
+            "active_database_access": database_access or 0,
+            "ca_demo_entries_remaining": 0 if database_access else max(0, 10 - demo_views),
+            "referral_joins": referrals or 0,
+        }
+    return JSONResponse(profile)
 
 
 @app.post("/webhook")
@@ -382,6 +476,7 @@ async def webapp_section(section_key: str):
 
 @app.get("/api/courses")
 async def api_courses(
+    request: Request,
     section_key: str,
     search: str | None = Query(default=None, max_length=100),
     faculty: str | None = Query(default=None, max_length=100),
@@ -390,6 +485,11 @@ async def api_courses(
     limit: int | None = Query(default=None, ge=1, le=500),
     offset: int = Query(default=0, ge=0, le=100000),
 ):
+    telegram_user, auth_error = await authenticated_mini_app_user(request)
+    if auth_error == "membership_required":
+        return JSONResponse({"detail": "Join the backup channel before using the Mini App."}, status_code=403)
+    if not telegram_user:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
     async with async_session() as session:
         if section_key == "all":
             result = await session.execute(select(Course).where(Course.is_active == True))  # noqa: E712

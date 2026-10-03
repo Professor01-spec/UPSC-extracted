@@ -198,6 +198,7 @@ class CAUserState(Base):
     affair_id = Column(Integer, ForeignKey("current_affairs.id", ondelete="CASCADE"), nullable=False)
     is_bookmarked = Column(Boolean, default=False, nullable=False)
     is_read = Column(Boolean, default=False, nullable=False)
+    is_demo_view = Column(Boolean, default=False, nullable=False)
     notes = Column(Text, nullable=True)
     revision_state = Column(String(32), default="new", nullable=False)
     last_viewed_at = Column(DateTime, nullable=True)
@@ -626,4 +627,11 @@ async def migrate_v7():
         await conn.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_referral_code "
             "ON users (referral_code) WHERE referral_code IS NOT NULL"
+        )
+
+
+async def migrate_v8():
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "ALTER TABLE ca_user_states ADD COLUMN IF NOT EXISTS is_demo_view BOOLEAN NOT NULL DEFAULT FALSE"
         )
