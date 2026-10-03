@@ -1,25 +1,25 @@
-# UPSC Course Zone by Professor 🥼
+# UPSC Course Zone by Professor
 
-Sirf **11 files** — saare secrets `app.env` me pehle se bhare hain (sirf 2 cheezein deploy ke baad daalni hain, wo Railway par pehle exist hi nahi karti).
+This repository runs a Python FastAPI + aiogram bot with PostgreSQL. Configure credentials through the hosting provider's environment settings. Never commit `app.env` or paste credential values into logs/issues.
 
 ## 🚀 Deploy Steps
 
-### 1. GitHub par upload karo
-Ye saari files (folder ke andar mat rakhna, seedha in files ko) apne repo me upload karo — GitHub "Add file → Upload files" se sab select karke ek saath drag-drop kar sakte ho, koi subfolder nahi hai ab.
-
-### 2. Railway
+### Railway
 1. https://railway.app → **New Project → Deploy from GitHub repo**
 2. Usi project me **+ New → Database → Add PostgreSQL**
 
-### 3. Sirf 2 Variables daalni hain (baaki sab `app.env` se auto-aa jayenge)
-Railway bot service → **Variables** tab:
+Bot service → **Variables** tab. Set these values there; do not commit them:
 
 | Key | Kahan se milega |
 |---|---|
-| `DATABASE_URL` | Postgres service par click → "Connect" tab → URL copy karo → shuru me `postgresql://` ko `postgresql+asyncpg://` kar dena |
-| `WEBAPP_BASE_URL` | Bot service → **Settings → Networking → Generate Domain** → jo URL mile wahi paste karo |
+| `BOT_TOKEN` | Telegram BotFather |
+| `ADMIN_ID` | Authorized Telegram administrator's numeric user ID |
+| `DATABASE_URL` | PostgreSQL connection URL; use the `postgresql+asyncpg://` SQLAlchemy scheme |
+| `WEBHOOK_SECRET_TOKEN` | Generate a random 1-256 character value using only letters, digits, `_`, and `-` |
+| `WEBAPP_BASE_URL` | Public HTTPS domain for the bot service; required for webhook setup |
+| `GEMINI_API_KEY` | Optional; required only for Gemini-powered features |
 
-⚠️ Ye do values Railway **tabhi generate karta hai jab Postgres bane aur domain bane** — isliye inhe pehle se bhar ke nahi de sakte, baaki sab (`BOT_TOKEN`, `ADMIN_ID`, etc.) `app.env` file me already hain.
+`PORT` and `RAILWAY_PUBLIC_DOMAIN` are provided by Railway. Without a valid `WEBHOOK_SECRET_TOKEN`, the service disables the Telegram webhook.
 
 ### 4. Redeploy
 Variables save karne ke baad Railway khud redeploy karega. **Deployments** tab me "Success" dikhna chahiye.
@@ -31,7 +31,7 @@ Variables save karne ke baad Railway khud redeploy karega. **Deployments** tab m
 
 ---
 
-## Files
+## Runtime files
 - `main.py` — server + bot dono ka entry point
 - `config.py` — env vars loader
 - `database.py` — models + DB connection + starting sections
@@ -39,7 +39,12 @@ Variables save karne ke baad Railway khud redeploy karega. **Deployments** tab m
 - `user_handlers.py` — sabhi user-facing flows
 - `admin_handlers.py` — sabhi admin commands
 - `webapp_template.py` — Mini App ka HTML
-- `app.env` — saari values pehle se bhari hain (2 chhod ke)
 - `requirements.txt`, `Procfile`, `.gitignore`
+
+`app.env` is a local-only convenience file and is ignored by Git. Production secrets must be configured in the host's environment settings.
+
+## Vercel
+
+This checkout is not currently configured as a Vercel deployment: it has no Vercel function configuration, and its bot starts background tasks intended for a persistent process. Do not treat a successful GitHub push as a Vercel-ready deployment. A serverless lifecycle and scheduled-task design must be validated before deploying it there.
 
 Koi error aaye Railway ke **Deployments → Logs** me, wahi paste kar dena — turant fix karunga.

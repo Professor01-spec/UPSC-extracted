@@ -63,6 +63,7 @@ class User(Base):
     joined_at = Column(DateTime, default=datetime.utcnow)
     is_banned = Column(Boolean, default=False)
     has_joined_backup_channel = Column(Boolean, default=False)
+    backup_channel_checked_at = Column(DateTime, nullable=True)
 
 
 class Order(Base):
@@ -112,6 +113,17 @@ class ConnectedChat(Base):
     id = Column(BigInteger, primary_key=True)
     type = Column(String(50)) # 'group', 'supergroup', or 'channel'
     added_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+
+    id = Column(Integer, primary_key=True)
+    actor_id = Column(BigInteger, nullable=False)
+    action = Column(String(100), nullable=False)
+    target_type = Column(String(50), nullable=False)
+    target_id = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 # ---------------- engine / session ----------------
@@ -446,3 +458,10 @@ async def migrate_v3():
                 if target_key not in existing_keys:
                     course.sections.append(target_sec)
         await session.commit()
+
+
+async def migrate_v4():
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS backup_channel_checked_at TIMESTAMP NULL"
+        )

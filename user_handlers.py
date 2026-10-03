@@ -27,7 +27,7 @@ from keyboards import (
 )
 
 # 🛡️ IMPORTING SECURITY & ADMIN STATES
-from security import scan_image_for_code
+from security import scan_image_for_code, verify_backup_channel_membership
 from admin_handlers import AI_STATE, ACTIVE_PROMOS
 
 logger = logging.getLogger(__name__)
@@ -112,20 +112,6 @@ async def _notify_admin_of_start(bot, tg_user, is_new: bool, user: User):
         logger.exception("Failed to notify admin of /start")
 
 
-async def _is_member_of_backup_channel(bot, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=BACKUP_CHANNEL, user_id=user_id)
-        return member.status in ("member", "administrator", "creator")
-    except TelegramForbiddenError:
-        logger.error(f"Backup-channel check failed for user {user_id}: bot is not an admin of {BACKUP_CHANNEL}.")
-        return False
-    except TelegramBadRequest:
-        logger.warning(f"Backup-channel check: user {user_id} not found in {BACKUP_CHANNEL}.")
-        return False
-    except Exception:
-        return False
-
-
 @router.message(CommandStart(deep_link=True))
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     user, is_new = await _get_or_create_user(message.from_user)
@@ -143,22 +129,19 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         except ValueError:
             pending_course_id = None
 
-    if not user.has_joined_backup_channel:
-        is_member = await _is_member_of_backup_channel(message.bot, message.from_user.id)
-        if not is_member:
-            if pending_course_id:
-                await state.update_data(pending_course_id=pending_course_id)
-            await message.answer(
-                f"👋 Welcome to <b>{BOT_NAME}</b>!\n\n"
-                "Joining our backup channel is required before you can access the bot — "
-                "this is a one-time step.",
-                reply_markup=join_channel_kb(BACKUP_CHANNEL),
-            )
-            return
-        async with async_session() as session:
-            u = await session.get(User, user.id)
-            u.has_joined_backup_channel = True
-            await session.commit()
+    is_member = await verify_backup_channel_membership(
+        message.bot, message.from_user.id, message.from_user
+    )
+    if not is_member:
+        if pending_course_id:
+            await state.update_data(pending_course_id=pending_course_id)
+        await message.answer(
+            f"👋 Welcome to <b>{BOT_NAME}</b>!\n\n"
+            "Joining our backup channel is required before you can access the bot — "
+            "this is a one-time step.",
+            reply_markup=join_channel_kb(BACKUP_CHANNEL),
+        )
+        return
 
     if pending_course_id:
         await _show_buy_screen(message, pending_course_id, tg_user=message.from_user)
@@ -174,7 +157,9 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
 
 @router.callback_query(F.data == "checkjoin")
 async def cb_check_join(call: CallbackQuery, state: FSMContext):
-    is_member = await _is_member_of_backup_channel(call.bot, call.from_user.id)
+    is_member = await verify_backup_channel_membership(
+        call.bot, call.from_user.id, call.from_user, force_refresh=True
+    )
     if not is_member:
         await call.answer(
             "We still can't see you in the channel — join, then try again 🙏",

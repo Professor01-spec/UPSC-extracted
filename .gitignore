@@ -1,0 +1,8 @@
+app.env
+bot_state_backup.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*

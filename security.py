@@ -104,6 +104,7 @@ ai_conversation_memory = defaultdict(list)  # user_id -> [{"ts": float, "role": 
 
 MAX_MESSAGE_LENGTH = 4000          # hard cap on any single message reaching the bot's logic (cost/DoS guard)
 BACKUP_CHECK_COOLDOWN_SEC = 30     # don't re-hit Telegram's get_chat_member more than once per 30s per user
+MEMBERSHIP_CACHE_TTL_SEC = 60
 AI_MEMORY_WINDOW_SEC = 72 * 3600   # Professor AI remembers each user's own last 72h, never mixes users
 
 JAILBREAK_PATTERNS = re.compile(
@@ -341,25 +342,27 @@ def admin_only(func):
 # ==============================================================================
 # 🔐 MANDATORY BACKUP-CHANNEL GATE (shared by Message + CallbackQuery paths)
 # ==============================================================================
-async def _user_has_joined_backup(bot_instance, user_id: int, tg_user) -> bool:
-    """DB-first (cheap), falls back to a live Telegram membership check only
-    when the DB doesn't already say True — caches a positive result back to
-    the DB so repeat interactions don't re-hit the Telegram API every time.
-    Also cooldown-limited: at most one live API check per user per 30s, so
-    a user spamming commands specifically to hammer Telegram's API (and
-    risk the bot itself getting rate-limited by Telegram) can't do that —
-    they just get told to wait, not silently DoS the bot's own API budget."""
-    async with async_session() as session:
-        u = await session.get(User, user_id)
-        if u and u.has_joined_backup_channel:
-            return True
-
+async def verify_backup_channel_membership(
+    bot_instance, user_id: int, tg_user=None, force_refresh: bool = False
+) -> bool:
+    """Use a short-lived persisted cache, then re-check membership with Telegram."""
     if not bot_instance or not BACKUP_CHANNEL:
         return False
 
+    now = datetime.utcnow()
+    async with async_session() as session:
+        u = await session.get(User, user_id)
+        if (
+            not force_refresh
+            and u
+            and u.backup_channel_checked_at
+            and (now - u.backup_channel_checked_at).total_seconds() < MEMBERSHIP_CACHE_TTL_SEC
+        ):
+            return bool(u.has_joined_backup_channel)
+
     last_check = backup_check_cooldown.get(user_id, 0)
     if time.time() - last_check < BACKUP_CHECK_COOLDOWN_SEC:
-        return False  # too soon to re-check live — treat as still-not-joined this time
+        return False
     backup_check_cooldown[user_id] = time.time()
 
     try:
@@ -368,16 +371,21 @@ async def _user_has_joined_backup(bot_instance, user_id: int, tg_user) -> bool:
     except Exception:
         joined = False
 
-    if joined:
-        async with async_session() as session:
-            u = await session.get(User, user_id)
-            if not u:
-                u = User(id=user_id, username=tg_user.username, first_name=tg_user.first_name)
-                session.add(u)
-            u.has_joined_backup_channel = True
+    async with async_session() as session:
+        u = await session.get(User, user_id)
+        if not u and tg_user:
+            u = User(id=user_id, username=tg_user.username, first_name=tg_user.first_name)
+            session.add(u)
+        if u:
+            u.has_joined_backup_channel = joined
+            u.backup_channel_checked_at = now
             await session.commit()
 
     return joined
+
+
+async def _user_has_joined_backup(bot_instance, user_id: int, tg_user) -> bool:
+    return await verify_backup_channel_membership(bot_instance, user_id, tg_user)
 
 
 def _backup_join_keyboard():

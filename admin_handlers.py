@@ -8,7 +8,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select, func, desc
 
-from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage, ConnectedChat
+from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage, ConnectedChat, AuditEvent
 from keyboards import AdminAddCourse, AdminBroadcast
 from config import ADMIN_ID
 from security import auto_delete_task
@@ -823,13 +823,22 @@ async def cb_approve(call: CallbackQuery):
         return
     order_id = int(call.data.split(":", 1)[1])
     async with async_session() as session:
-        order = await session.get(Order, order_id)
+        result = await session.execute(
+            select(Order).where(Order.id == order_id).with_for_update()
+        )
+        order = result.scalar_one_or_none()
         if not order or order.status != "pending":
             await call.answer("This order has already been processed.", show_alert=True)
             return
         order.status = "approved"
         order.decided_at = datetime.utcnow()
         session.add(UserCourse(user_id=order.user_id, course_id=order.course_id))
+        session.add(AuditEvent(
+            actor_id=call.from_user.id,
+            action="payment.approved",
+            target_type="order",
+            target_id=str(order.id),
+        ))
         await session.commit()
         course = await session.get(Course, order.course_id)
 
@@ -863,12 +872,21 @@ async def cb_reject(call: CallbackQuery):
         return
     order_id = int(call.data.split(":", 1)[1])
     async with async_session() as session:
-        order = await session.get(Order, order_id)
+        result = await session.execute(
+            select(Order).where(Order.id == order_id).with_for_update()
+        )
+        order = result.scalar_one_or_none()
         if not order or order.status != "pending":
             await call.answer("This order has already been processed.", show_alert=True)
             return
         order.status = "rejected"
         order.decided_at = datetime.utcnow()
+        session.add(AuditEvent(
+            actor_id=call.from_user.id,
+            action="payment.rejected",
+            target_type="order",
+            target_id=str(order.id),
+        ))
         await session.commit()
 
     if call.message.caption:

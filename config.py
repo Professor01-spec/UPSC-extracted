@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv("app.env")  # explicit filename — avoids the hidden-dotfile problem on mobile
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "7209486623"))
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 BACKUP_CHANNEL = os.environ.get("BACKUP_CHANNEL", "https://t.me/upscse27")
@@ -32,5 +32,6 @@ if not _raw_webapp_url:
 
 WEBAPP_BASE_URL = _raw_webapp_url
 PORT = int(os.environ.get("PORT", "8080"))
+WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "").strip()
 
 BOT_NAME = "UPSC Course Zone by Professor"

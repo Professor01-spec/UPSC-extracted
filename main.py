@@ -1,5 +1,8 @@
 import logging
 import asyncio
+import hmac
+import json
+import re
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -12,8 +15,8 @@ from aiogram.types import Update, BotCommand, BotCommandScopeDefault, BotCommand
 from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select
 
-from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID
-from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, async_session, Section, Course, ConnectedChat
+from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID, WEBHOOK_SECRET_TOKEN
+from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, migrate_v4, async_session, Section, Course, ConnectedChat
 from keyboards import get_line
 from webapp_template import render_section_page
 from security import (
@@ -28,6 +31,8 @@ import admin_handlers
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+WEBHOOK_BODY_LIMIT = 1024 * 1024
+WEBHOOK_SECRET_VALID = bool(re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET_TOKEN))
 
 # aiogram 3.7+ requires parse_mode via DefaultBotProperties, not a direct kwarg.
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -153,6 +158,7 @@ async def daily_promotional_task(bot_instance: Bot):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await migrate_v4()
     await seed_sections()
     await seed_courses()
     await migrate_v2()  # idempotent — restructures an existing DB to the v2 home-screen layout
@@ -178,18 +184,28 @@ async def lifespan(app: FastAPI):
     except TelegramBadRequest:
         logger.exception("Failed to set bot commands")
 
-    if WEBAPP_BASE_URL:
+    if WEBAPP_BASE_URL and WEBHOOK_SECRET_VALID:
         webhook_url = f"{WEBAPP_BASE_URL}/webhook"
         try:
-            await bot.set_webhook(webhook_url, drop_pending_updates=True)
-            logger.info(f"Webhook set to {webhook_url}")
+            await bot.set_webhook(
+                webhook_url,
+                secret_token=WEBHOOK_SECRET_TOKEN,
+                drop_pending_updates=False,
+            )
+            logger.info("Telegram webhook configured")
         except Exception:
             # Don't let a bad/unresolvable WEBAPP_BASE_URL crash the whole
             # container — log it loudly and keep the web server (and health
             # check) alive so the deployment doesn't restart-loop.
-            logger.exception(f"Failed to set webhook to '{webhook_url}' — check WEBAPP_BASE_URL")
+            logger.exception("Failed to configure Telegram webhook")
+    elif not WEBHOOK_SECRET_VALID:
+        logger.error("Telegram webhook not configured: WEBHOOK_SECRET_TOKEN is missing or invalid")
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            logger.exception("Failed to disable Telegram webhook without a valid secret")
     else:
-        logger.warning("WEBAPP_BASE_URL not set and RAILWAY_PUBLIC_DOMAIN unavailable — webhook NOT configured yet.")
+        logger.warning("Public webhook URL unavailable — webhook NOT configured yet.")
 
     # Start the 24h background loop task automatically
     asyncio.create_task(daily_promotional_task(bot))
@@ -215,8 +231,28 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update(**data)
+    if not WEBHOOK_SECRET_VALID:
+        return JSONResponse({"detail": "Webhook unavailable"}, status_code=503)
+    supplied_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(supplied_secret, WEBHOOK_SECRET_TOKEN):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > WEBHOOK_BODY_LIMIT:
+                return JSONResponse({"detail": "Request too large"}, status_code=413)
+        except ValueError:
+            return JSONResponse({"detail": "Invalid request"}, status_code=400)
+    body = await request.body()
+    if len(body) > WEBHOOK_BODY_LIMIT:
+        return JSONResponse({"detail": "Request too large"}, status_code=413)
+    try:
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError("Expected an update object")
+        update = Update(**data)
+    except (ValueError, TypeError):
+        return JSONResponse({"detail": "Invalid request"}, status_code=400)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
